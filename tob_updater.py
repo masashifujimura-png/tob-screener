@@ -74,11 +74,16 @@ def safe_float(value) -> float | None:
         return None
 
 
-def upsert_batch(table: str, rows: list[dict], conflict_key: str, batch_size: int = 500):
-    """Supabase にバッチ upsert する。"""
+def upsert_batch(table: str, rows: list[dict], conflict_key: str,
+                  batch_size: int = 500, default_to_null: bool = True):
+    """Supabase にバッチ upsert する。
+    default_to_null=False にすると、行に含まれないカラムは既存値を保持する。
+    """
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
-        supabase.table(table).upsert(batch, on_conflict=conflict_key).execute()
+        supabase.table(table).upsert(
+            batch, on_conflict=conflict_key, default_to_null=default_to_null,
+        ).execute()
 
 
 # ---------------------------------------------------------------------------
@@ -125,61 +130,93 @@ def master_sync(jpx_df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 # Phase 2: 一括株価更新
 # ---------------------------------------------------------------------------
-def bulk_download_prices(codes: list[str]) -> dict:
-    """yf.download() で全銘柄の株価を一括取得。"""
-    tickers = [f"{c}.T" for c in codes]
+def _parse_price_batch(data, batch_codes: list[str], batch_tickers: list[str]) -> dict:
+    """yf.download() の結果から銘柄ごとの株価データを抽出。"""
     price_data = {}
-    batch_size = 500
-
-    for i in range(0, len(tickers), batch_size):
-        batch_tickers = tickers[i:i + batch_size]
-        batch_codes = codes[i:i + batch_size]
-        log.info(f"  株価取得中… {min(i + batch_size, len(tickers))}/{len(tickers)}")
-
+    for code, ticker in zip(batch_codes, batch_tickers):
         try:
-            data = yf.download(
-                batch_tickers, period="1y",
-                group_by="ticker", threads=True, progress=False,
-            )
-            if data.empty:
+            tk_data = data if len(batch_tickers) == 1 else data[ticker]
+            if tk_data.empty or tk_data["Close"].dropna().empty:
                 continue
 
-            for code, ticker in zip(batch_codes, batch_tickers):
-                try:
-                    tk_data = data if len(batch_tickers) == 1 else data[ticker]
-                    if tk_data.empty or tk_data["Close"].dropna().empty:
-                        continue
+            close = tk_data["Close"].dropna()
+            volume = tk_data["Volume"].dropna()
 
-                    close = tk_data["Close"].dropna()
-                    volume = tk_data["Volume"].dropna()
+            volume_ratio = None
+            if len(volume) >= 10:
+                avg_5d = volume.tail(5).mean()
+                avg_60d = volume.tail(60).mean() if len(volume) >= 60 else volume.mean()
+                if avg_60d and avg_60d > 0:
+                    volume_ratio = float(avg_5d / avg_60d)
 
-                    volume_ratio = None
-                    if len(volume) >= 10:
-                        avg_5d = volume.tail(5).mean()
-                        avg_60d = volume.tail(60).mean() if len(volume) >= 60 else volume.mean()
-                        if avg_60d and avg_60d > 0:
-                            volume_ratio = float(avg_5d / avg_60d)
+            price_drop_pct = None
+            if len(close) > 0:
+                week52_high = float(close.max())
+                current_price = float(close.iloc[-1])
+                if week52_high > 0:
+                    price_drop_pct = (week52_high - current_price) / week52_high
 
-                    price_drop_pct = None
-                    if len(close) > 0:
-                        week52_high = float(close.max())
-                        current_price = float(close.iloc[-1])
-                        if week52_high > 0:
-                            price_drop_pct = (week52_high - current_price) / week52_high
-
-                    price_data[code] = {
-                        "volume_ratio": volume_ratio,
-                        "price_drop_pct": price_drop_pct,
-                        "current_price": float(close.iloc[-1]) if len(close) > 0 else None,
-                    }
-                except Exception:
-                    continue
-        except Exception as e:
-            log.warning(f"  バッチ株価取得エラー ({i}〜): {e}")
+            price_data[code] = {
+                "volume_ratio": volume_ratio,
+                "price_drop_pct": price_drop_pct,
+                "current_price": float(close.iloc[-1]) if len(close) > 0 else None,
+            }
+        except Exception:
             continue
+    return price_data
 
-        if i + batch_size < len(tickers):
-            time.sleep(1)
+
+def bulk_download_prices(codes: list[str]) -> dict:
+    """yf.download() で全銘柄の株価を一括取得。レートリミット時はリトライ。"""
+    price_data = {}
+    batch_size = 200  # レートリミット回避のためバッチを小さく
+    remaining_codes = list(codes)
+
+    for attempt in range(3):  # 最大3ラウンド
+        if not remaining_codes:
+            break
+        if attempt > 0:
+            wait = 30 * attempt
+            log.info(f"  リトライ {attempt}: {len(remaining_codes)} 銘柄を {wait}秒後に再取得")
+            time.sleep(wait)
+
+        failed_codes = []
+        for i in range(0, len(remaining_codes), batch_size):
+            batch_codes = remaining_codes[i:i + batch_size]
+            batch_tickers = [f"{c}.T" for c in batch_codes]
+            log.info(f"  株価取得中… {min(i + batch_size, len(remaining_codes))}/{len(remaining_codes)}"
+                     + (f" (リトライ{attempt})" if attempt > 0 else ""))
+
+            try:
+                data = yf.download(
+                    batch_tickers, period="1y",
+                    group_by="ticker", threads=True, progress=False,
+                )
+                if data.empty:
+                    failed_codes.extend(batch_codes)
+                    continue
+
+                batch_result = _parse_price_batch(data, batch_codes, batch_tickers)
+                price_data.update(batch_result)
+
+                # 取得できなかった銘柄を記録
+                for c in batch_codes:
+                    if c not in batch_result:
+                        failed_codes.append(c)
+
+            except Exception as e:
+                log.warning(f"  バッチ株価取得エラー: {e}")
+                failed_codes.extend(batch_codes)
+                continue
+
+            time.sleep(2)  # バッチ間のウェイト
+
+        remaining_codes = failed_codes
+        if remaining_codes:
+            log.info(f"  ラウンド{attempt + 1}完了: 成功 {len(price_data)}, 残り {len(remaining_codes)}")
+
+    if remaining_codes:
+        log.warning(f"  株価取得断念: {len(remaining_codes)} 銘柄（次回リトライ）")
 
     return price_data
 
@@ -225,7 +262,7 @@ def update_prices(codes: list[str], price_data: dict):
             "updated_at": now,
         })
 
-    upsert_batch("tob_stocks", rows, "code")
+    upsert_batch("tob_stocks", rows, "code", default_to_null=False)
     log.info(f"  {len(rows)} 銘柄の株価データを更新")
 
 
@@ -329,7 +366,7 @@ def gap_fill_static(is_quarterly_refresh: bool = False):
             time.sleep(2)
 
     if results:
-        upsert_batch("tob_stocks", results, "code")
+        upsert_batch("tob_stocks", results, "code", default_to_null=False)
     log.info(f"  静的データ補完完了: {len(results)} 成功 / {failed} 失敗 / {len(target_codes)} 対象")
 
 
