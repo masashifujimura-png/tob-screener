@@ -227,8 +227,8 @@ def update_prices(codes: list[str], price_data: dict, code_to_info: dict):
     log.info(f"  株価取得成功: {len(price_data)}/{len(codes)} 銘柄")
 
     # 既存の静的データを読み込み
-    resp = supabase.table("tob_stocks").select("code, shares_outstanding, bps").execute()
-    static_map = {r["code"]: r for r in resp.data} if resp.data else {}
+    static_data = fetch_all_rows("tob_stocks", "code, shares_outstanding, bps")
+    static_map = {r["code"]: r for r in static_data}
 
     now = datetime.now(timezone.utc).isoformat()
     rows = []
@@ -320,27 +320,47 @@ def fetch_static_data(code: str, max_retries: int = 2) -> dict | None:
     return None
 
 
-def gap_fill_static(is_quarterly_refresh: bool = False):
+def fetch_all_rows(table: str, select: str, filter_fn=None) -> list[dict]:
+    """Supabase の1000件制限を回避して全行取得。"""
+    all_data = []
+    page_size = 1000
+    offset = 0
+    while True:
+        query = supabase.table(table).select(select).range(offset, offset + page_size - 1)
+        if filter_fn:
+            query = filter_fn(query)
+        resp = query.execute()
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < page_size:
+            break
+        offset += page_size
+    return all_data
+
+
+def gap_fill_static(code_to_info: dict, is_quarterly_refresh: bool = False):
     """NULLの銘柄だけ静的データを補完。四半期リフレッシュ時は古いデータも対象。"""
     log.info("Phase 3: 静的データ補完")
 
     if is_quarterly_refresh:
-        # 今月1日より前に取得したデータは再取得対象
         first_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        resp = supabase.table("tob_stocks").select("code") \
-            .or_(f"static_updated_at.is.null,static_updated_at.lt.{first_of_month.isoformat()}") \
-            .execute()
+        data = fetch_all_rows(
+            "tob_stocks", "code",
+            lambda q: q.or_(f"static_updated_at.is.null,static_updated_at.lt.{first_of_month.isoformat()}"),
+        )
         log.info("  四半期リフレッシュモード: 古い静的データも再取得対象")
     else:
-        resp = supabase.table("tob_stocks").select("code") \
-            .or_("shares_outstanding.is.null,bps.is.null") \
-            .execute()
+        data = fetch_all_rows(
+            "tob_stocks", "code",
+            lambda q: q.or_("shares_outstanding.is.null,bps.is.null"),
+        )
 
-    if not resp.data:
+    if not data:
         log.info("  補完対象の銘柄なし")
         return
 
-    target_codes = [r["code"] for r in resp.data]
+    target_codes = [r["code"] for r in data]
     log.info(f"  補完対象: {len(target_codes)} 銘柄")
 
     now = datetime.now(timezone.utc).isoformat()
@@ -358,6 +378,9 @@ def gap_fill_static(is_quarterly_refresh: bool = False):
                 code = futures[future]
                 result = future.result()
                 if result is not None:
+                    info = code_to_info.get(code, {})
+                    result["name"] = info.get("name", "")
+                    result["market"] = info.get("market", "")
                     result["static_updated_at"] = now
                     results.append(result)
                 else:
@@ -369,7 +392,7 @@ def gap_fill_static(is_quarterly_refresh: bool = False):
             time.sleep(2)
 
     if results:
-        upsert_batch("tob_stocks", results, "code", default_to_null=False)
+        upsert_batch("tob_stocks", results, "code")
     log.info(f"  静的データ補完完了: {len(results)} 成功 / {failed} 失敗 / {len(target_codes)} 対象")
 
 
@@ -462,7 +485,7 @@ def main():
     # Phase 3: 静的データ補完
     current_month = datetime.now(timezone.utc).month
     is_quarterly = current_month in QUARTERLY_MONTHS
-    gap_fill_static(is_quarterly_refresh=is_quarterly)
+    gap_fill_static(code_to_info, is_quarterly_refresh=is_quarterly)
 
     # Phase 4: 親会社情報更新
     update_parent_extra()
