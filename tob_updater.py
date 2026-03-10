@@ -221,7 +221,7 @@ def bulk_download_prices(codes: list[str]) -> dict:
     return price_data
 
 
-def update_prices(codes: list[str], price_data: dict):
+def update_prices(codes: list[str], price_data: dict, code_to_info: dict):
     """株価データ + 静的データから market_cap/pbr を算出して upsert。"""
     log.info("Phase 2: 一括株価更新")
     log.info(f"  株価取得成功: {len(price_data)}/{len(codes)} 銘柄")
@@ -237,6 +237,7 @@ def update_prices(codes: list[str], price_data: dict):
         if not price:
             continue
 
+        info = code_to_info.get(code, {})
         current_price = price.get("current_price")
         static = static_map.get(code, {})
         shares = static.get("shares_outstanding")
@@ -254,6 +255,8 @@ def update_prices(codes: list[str], price_data: dict):
 
         rows.append({
             "code": code,
+            "name": info.get("name", ""),
+            "market": info.get("market", ""),
             "current_price": safe_float(current_price),
             "volume_ratio": safe_float(price.get("volume_ratio")),
             "price_drop_pct": safe_float(price.get("price_drop_pct")),
@@ -262,7 +265,7 @@ def update_prices(codes: list[str], price_data: dict):
             "updated_at": now,
         })
 
-    upsert_batch("tob_stocks", rows, "code", default_to_null=False)
+    upsert_batch("tob_stocks", rows, "code")
     log.info(f"  {len(rows)} 銘柄の株価データを更新")
 
 
@@ -450,10 +453,11 @@ def main():
     jpx_df = fetch_jpx_list()
     master_sync(jpx_df)
     codes = jpx_df["code"].tolist()
+    code_to_info = {r["code"]: {"name": r["name"], "market": r["market"]} for _, r in jpx_df.iterrows()}
 
     # Phase 2: 一括株価更新
     price_data = bulk_download_prices(codes)
-    update_prices(codes, price_data)
+    update_prices(codes, price_data, code_to_info)
 
     # Phase 3: 静的データ補完
     current_month = datetime.now(timezone.utc).month
