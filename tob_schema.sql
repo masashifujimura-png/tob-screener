@@ -12,7 +12,10 @@ create table tob_stocks (
   volume_ratio numeric,
   price_drop_pct numeric,
   current_price numeric,
-  updated_at timestamptz default now()
+  shares_outstanding bigint,
+  bps numeric,                          -- Book Value Per Share
+  updated_at timestamptz default now(),
+  static_updated_at timestamptz         -- 静的データ最終取得日
 );
 
 -- parent_subsidiary: 親子上場データ（CSVの代わり）
