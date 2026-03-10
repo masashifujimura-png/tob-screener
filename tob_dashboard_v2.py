@@ -26,15 +26,31 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
 # ---------------------------------------------------------------------------
-# Supabase からデータ読み込み
+# Supabase からデータ読み込み（1000件制限をページネーションで回避）
 # ---------------------------------------------------------------------------
+def _fetch_all(table: str, select: str = "*") -> list[dict]:
+    """Supabase の1000件制限を回避して全行取得。"""
+    all_data = []
+    page_size = 1000
+    offset = 0
+    while True:
+        resp = supabase.table(table).select(select).range(offset, offset + page_size - 1).execute()
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        if len(resp.data) < page_size:
+            break
+        offset += page_size
+    return all_data
+
+
 @st.cache_data(ttl=3600)
 def load_stocks() -> pd.DataFrame:
     """tob_stocks テーブルから全銘柄データを読み込む。"""
-    resp = supabase.table("tob_stocks").select("*").execute()
-    if not resp.data:
+    data = _fetch_all("tob_stocks")
+    if not data:
         return pd.DataFrame()
-    df = pd.DataFrame(resp.data)
+    df = pd.DataFrame(data)
     df["market_cap"] = pd.to_numeric(df["market_cap"], errors="coerce")
     df["pbr"] = pd.to_numeric(df["pbr"], errors="coerce")
     df["net_cash_ratio"] = pd.to_numeric(df["net_cash_ratio"], errors="coerce")
@@ -47,20 +63,20 @@ def load_stocks() -> pd.DataFrame:
 
 @st.cache_data(ttl=3600)
 def load_parent_subsidiary() -> pd.DataFrame:
-    resp = supabase.table("parent_subsidiary").select("*").execute()
-    if not resp.data:
+    data = _fetch_all("parent_subsidiary")
+    if not data:
         return pd.DataFrame(columns=["parent_code", "parent_name", "child_code", "child_name", "holding_pct"])
-    df = pd.DataFrame(resp.data)
+    df = pd.DataFrame(data)
     df["holding_pct"] = pd.to_numeric(df["holding_pct"], errors="coerce")
     return df
 
 
 @st.cache_data(ttl=3600)
 def load_parent_extra() -> pd.DataFrame:
-    resp = supabase.table("parent_extra").select("*").execute()
-    if not resp.data:
+    data = _fetch_all("parent_extra")
+    if not data:
         return pd.DataFrame(columns=["parent_code", "parent_pbr", "activist_in_parent", "activist_names"])
-    df = pd.DataFrame(resp.data)
+    df = pd.DataFrame(data)
     df["parent_pbr"] = pd.to_numeric(df["parent_pbr"], errors="coerce")
     return df
 
