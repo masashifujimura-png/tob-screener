@@ -17,8 +17,8 @@ from supabase import create_client
 # ---------------------------------------------------------------------------
 # 設定
 # ---------------------------------------------------------------------------
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]  # anon キーで OK (読み取りのみ)
+SUPABASE_URL = os.environ.get("SUPABASE_URL") or st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY") or st.secrets["SUPABASE_KEY"]
 
 st.set_page_config(page_title="TOBスクリーニング ダッシュボード", layout="wide")
 
