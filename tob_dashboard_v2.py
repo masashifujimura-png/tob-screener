@@ -58,6 +58,10 @@ def load_stocks() -> pd.DataFrame:
     df["volume_ratio"] = pd.to_numeric(df["volume_ratio"], errors="coerce")
     df["price_drop_pct"] = pd.to_numeric(df["price_drop_pct"], errors="coerce")
     df["current_price"] = pd.to_numeric(df["current_price"], errors="coerce")
+    if "eps" in df.columns:
+        df["eps"] = pd.to_numeric(df["eps"], errors="coerce")
+    if "equity_ratio" in df.columns:
+        df["equity_ratio"] = pd.to_numeric(df["equity_ratio"], errors="coerce")
     return df
 
 
@@ -131,21 +135,24 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame) -> pd.Da
 def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     out = df.copy()
 
+    # PBR Score: PBR 2.0以下で高スコア（バックテスト: TOBターゲット中央値1.11）
     pbr = out["pbr"].clip(lower=0, upper=5)
-    out["score_pbr"] = np.where(pbr.isna(), 0, np.clip((1.5 - pbr) / 1.5, 0, 1) * 100)
+    out["score_pbr"] = np.where(pbr.isna(), 0, np.clip((2.0 - pbr) / 2.0, 0, 1) * 100)
 
     nc = out["net_cash_ratio"].fillna(-1)
     out["score_nc"] = np.clip((nc + 0.5) / 1.0, 0, 1) * 100
 
+    # Small Cap Score: 500億円以下で高スコア（バックテスト: 中央値1399億円）
     mc = out["market_cap"].fillna(1e12)
     mc_billion = mc / 1e9
-    out["score_smallcap"] = np.clip((100 - mc_billion) / 90, 0, 1) * 100
+    out["score_smallcap"] = np.clip((500 - mc_billion) / 450, 0, 1) * 100
 
     vr = out["volume_ratio"].fillna(1.0)
     out["score_volume"] = np.clip((vr - 1.0) / 2.0, 0, 1) * 100
 
+    # Price Drop Score: 40%下落で満点（バックテスト: 最も有効なファクター）
     pd_pct = out["price_drop_pct"].fillna(0)
-    out["score_pricedrop"] = np.clip(pd_pct / 0.5, 0, 1) * 100
+    out["score_pricedrop"] = np.clip(pd_pct / 0.4, 0, 1) * 100
 
     has_parent = out["top_sh_code"].notna()
     top_pct = out["top_sh_pct"].fillna(0)
@@ -294,10 +301,10 @@ def main():
 
     st.sidebar.header("指標ウェイト")
     w_pbr = st.sidebar.slider("PBR割安", 0, 50, 25)
-    w_nc = st.sidebar.slider("ネットキャッシュ比率", 0, 50, 25)
-    w_smallcap = st.sidebar.slider("低時価総額", 0, 50, 15)
-    w_volume = st.sidebar.slider("出来高急増", 0, 50, 20)
-    w_pricedrop = st.sidebar.slider("株価下落(52週高値比)", 0, 50, 15)
+    w_nc = st.sidebar.slider("ネットキャッシュ比率", 0, 50, 20)
+    w_smallcap = st.sidebar.slider("低時価総額", 0, 50, 20)
+    w_volume = st.sidebar.slider("出来高急増", 0, 50, 5)
+    w_pricedrop = st.sidebar.slider("株価下落(52週高値比)", 0, 50, 25)
     w_top_sh = st.sidebar.slider("親子上場", 0, 50, 20)
 
     weights = {

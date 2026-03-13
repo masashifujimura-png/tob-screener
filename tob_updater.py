@@ -1,13 +1,13 @@
-"""TOB スクリーニング データ更新スクリプト (v2 - 4フェーズアーキテクチャ)
+"""TOB スクリーニング データ更新スクリプト (v3 - J-Quants API)
 
-Phase 1: マスター同期 — JPX一覧 → 全銘柄を tob_stocks に登録（NULLでもOK）
-Phase 2: 一括株価更新 — yf.download() → 株価系指標 + market_cap/PBR算出
-Phase 3: 静的データ補完 — NULLの銘柄だけ個別取得（日々対象が減る）
-Phase 4: 親会社情報更新 — アクティビスト判定
+Phase 1: マスター同期 — J-Quants 銘柄一覧 → tob_stocks
+Phase 2: 株価更新   — J-Quants 日次株価 → price_history → 指標算出
+Phase 3: 財務更新   — J-Quants 決算サマリー → tob_stocks
+Phase 4: 指標算出   — price_history + 財務データ → market_cap / pbr / net_cash_ratio
+Phase 5: 親会社情報 — yfinance アクティビスト判定（据置）
 """
 
 import os
-import sys
 import time
 import logging
 from datetime import datetime, timezone
@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+import jquantsapi
 import yfinance as yf
 from supabase import create_client
 
@@ -23,11 +24,13 @@ from supabase import create_client
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", os.environ.get("SUPABASE_KEY"))
-MAX_WORKERS = 3
-JPX_URL = "https://www.jpx.co.jp/markets/statistics-equities/misc/tvdivq0000001vg2-att/data_j.xls"
+JQUANTS_API_KEY = os.environ["JQUANTS_API_KEY"]
 
-# 四半期リフレッシュ対象月（決算シーズン）
-QUARTERLY_MONTHS = {1, 4, 7, 10}
+MAX_WORKERS = 3
+RATE_LIMIT_INTERVAL = 15.0  # 秒 (Free tier 5 req/min → 12s間隔、余裕込みで15s)
+PRICE_HISTORY_DAYS = 260    # 約1年分の営業日数
+FIN_BOOTSTRAP_DAYS = 150    # 初回: 約7ヶ月分（ほぼ全銘柄カバー）
+FIN_DAILY_MAX_DAYS = 30     # 日次更新時の最大取得日数
 
 ACTIVIST_KEYWORDS = [
     "effissimo", "エフィッシモ",
@@ -57,267 +60,70 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+jquants = jquantsapi.ClientV2(api_key=JQUANTS_API_KEY)
 
 
 # ---------------------------------------------------------------------------
 # ユーティリティ
 # ---------------------------------------------------------------------------
+class RateLimiter:
+    """J-Quants API Free tier 用レートリミッター。"""
+    def __init__(self, interval: float = RATE_LIMIT_INTERVAL):
+        self.interval = interval
+        self.last_call = 0.0
+
+    def wait(self):
+        elapsed = time.time() - self.last_call
+        if elapsed < self.interval:
+            time.sleep(self.interval - elapsed)
+        self.last_call = time.time()
+
+
+rate_limiter = RateLimiter()
+
+
+def jquants_call(fn, *args, max_retries=3, **kwargs):
+    """J-Quants API呼び出しのラッパー。429エラー時にリトライ。"""
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait = 60 * (attempt + 1)
+                log.warning(f"  429 Rate limit, {wait}秒待機... (attempt {attempt+1}/{max_retries})")
+                time.sleep(wait)
+            else:
+                raise
+    return None
+
+
 def safe_float(value) -> float | None:
-    """NaN/None を None に、それ以外を float に変換。"""
     if value is None:
         return None
-    if isinstance(value, float) and np.isnan(value):
+    try:
+        v = float(value)
+        return None if np.isnan(v) else v
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_int(value) -> int | None:
+    if value is None:
         return None
     try:
-        return float(value)
+        v = float(value)
+        return None if np.isnan(v) else int(v)
     except (TypeError, ValueError):
         return None
 
 
 def upsert_batch(table: str, rows: list[dict], conflict_key: str,
                   batch_size: int = 500, default_to_null: bool = True):
-    """Supabase にバッチ upsert する。
-    default_to_null=False にすると、行に含まれないカラムは既存値を保持する。
-    """
     for i in range(0, len(rows), batch_size):
         batch = rows[i:i + batch_size]
         supabase.table(table).upsert(
             batch, on_conflict=conflict_key, default_to_null=default_to_null,
         ).execute()
-
-
-# ---------------------------------------------------------------------------
-# Phase 1: マスター同期
-# ---------------------------------------------------------------------------
-def fetch_jpx_list() -> pd.DataFrame:
-    """JPX 上場企業一覧を取得。"""
-    log.info("JPX 上場企業一覧を取得中…")
-    df = pd.read_excel(JPX_URL)
-    df = df.rename(columns={
-        "コード": "code",
-        "銘柄名": "name",
-        "市場・商品区分": "market",
-    })
-    df = df[["code", "name", "market"]].dropna(subset=["code"])
-    df["code"] = df["code"].astype(str).str.strip()
-    market_map = {
-        "プライム（内国株式）": "プライム",
-        "スタンダード（内国株式）": "スタンダード",
-        "グロース（内国株式）": "グロース",
-    }
-    df["market"] = df["market"].map(market_map)
-    df = df.dropna(subset=["market"])
-    log.info(f"JPX 一覧: {len(df)} 銘柄")
-    return df.reset_index(drop=True)
-
-
-def master_sync(jpx_df: pd.DataFrame):
-    """全銘柄をtob_stocksに登録（name/marketのみ更新、財務データは触らない）。"""
-    log.info("Phase 1: マスター同期")
-    now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for _, r in jpx_df.iterrows():
-        rows.append({
-            "code": r["code"],
-            "name": r["name"],
-            "market": r["market"],
-            "updated_at": now,
-        })
-    upsert_batch("tob_stocks", rows, "code")
-    log.info(f"  {len(rows)} 銘柄をマスター同期完了")
-
-
-# ---------------------------------------------------------------------------
-# Phase 2: 一括株価更新
-# ---------------------------------------------------------------------------
-def _parse_price_batch(data, batch_codes: list[str], batch_tickers: list[str]) -> dict:
-    """yf.download() の結果から銘柄ごとの株価データを抽出。"""
-    price_data = {}
-    for code, ticker in zip(batch_codes, batch_tickers):
-        try:
-            tk_data = data if len(batch_tickers) == 1 else data[ticker]
-            if tk_data.empty or tk_data["Close"].dropna().empty:
-                continue
-
-            close = tk_data["Close"].dropna()
-            volume = tk_data["Volume"].dropna()
-
-            volume_ratio = None
-            if len(volume) >= 10:
-                avg_5d = volume.tail(5).mean()
-                avg_60d = volume.tail(60).mean() if len(volume) >= 60 else volume.mean()
-                if avg_60d and avg_60d > 0:
-                    volume_ratio = float(avg_5d / avg_60d)
-
-            price_drop_pct = None
-            if len(close) > 0:
-                week52_high = float(close.max())
-                current_price = float(close.iloc[-1])
-                if week52_high > 0:
-                    price_drop_pct = (week52_high - current_price) / week52_high
-
-            price_data[code] = {
-                "volume_ratio": volume_ratio,
-                "price_drop_pct": price_drop_pct,
-                "current_price": float(close.iloc[-1]) if len(close) > 0 else None,
-            }
-        except Exception:
-            continue
-    return price_data
-
-
-def bulk_download_prices(codes: list[str]) -> dict:
-    """yf.download() で全銘柄の株価を一括取得。レートリミット時はリトライ。"""
-    price_data = {}
-    batch_size = 200  # レートリミット回避のためバッチを小さく
-    remaining_codes = list(codes)
-
-    for attempt in range(3):  # 最大3ラウンド
-        if not remaining_codes:
-            break
-        if attempt > 0:
-            wait = 30 * attempt
-            log.info(f"  リトライ {attempt}: {len(remaining_codes)} 銘柄を {wait}秒後に再取得")
-            time.sleep(wait)
-
-        failed_codes = []
-        for i in range(0, len(remaining_codes), batch_size):
-            batch_codes = remaining_codes[i:i + batch_size]
-            batch_tickers = [f"{c}.T" for c in batch_codes]
-            log.info(f"  株価取得中… {min(i + batch_size, len(remaining_codes))}/{len(remaining_codes)}"
-                     + (f" (リトライ{attempt})" if attempt > 0 else ""))
-
-            try:
-                data = yf.download(
-                    batch_tickers, period="1y",
-                    group_by="ticker", threads=True, progress=False,
-                )
-                if data.empty:
-                    failed_codes.extend(batch_codes)
-                    continue
-
-                batch_result = _parse_price_batch(data, batch_codes, batch_tickers)
-                price_data.update(batch_result)
-
-                # 取得できなかった銘柄を記録
-                for c in batch_codes:
-                    if c not in batch_result:
-                        failed_codes.append(c)
-
-            except Exception as e:
-                log.warning(f"  バッチ株価取得エラー: {e}")
-                failed_codes.extend(batch_codes)
-                continue
-
-            time.sleep(2)  # バッチ間のウェイト
-
-        remaining_codes = failed_codes
-        if remaining_codes:
-            log.info(f"  ラウンド{attempt + 1}完了: 成功 {len(price_data)}, 残り {len(remaining_codes)}")
-
-    if remaining_codes:
-        log.warning(f"  株価取得断念: {len(remaining_codes)} 銘柄（次回リトライ）")
-
-    return price_data
-
-
-def update_prices(codes: list[str], price_data: dict, code_to_info: dict):
-    """株価データ + 静的データから market_cap/pbr を算出して upsert。"""
-    log.info("Phase 2: 一括株価更新")
-    log.info(f"  株価取得成功: {len(price_data)}/{len(codes)} 銘柄")
-
-    # 既存の静的データを読み込み
-    static_data = fetch_all_rows("tob_stocks", "code, shares_outstanding, bps")
-    static_map = {r["code"]: r for r in static_data}
-
-    now = datetime.now(timezone.utc).isoformat()
-    rows = []
-    for code in codes:
-        price = price_data.get(code)
-        if not price:
-            continue
-
-        info = code_to_info.get(code, {})
-        current_price = price.get("current_price")
-        static = static_map.get(code, {})
-        shares = static.get("shares_outstanding")
-        bps = static.get("bps")
-
-        # market_cap = 株価 × 発行済株式数
-        market_cap = None
-        if current_price and shares:
-            market_cap = int(current_price * shares)
-
-        # pbr = 株価 / BPS
-        pbr = None
-        if current_price and bps and bps > 0:
-            pbr = current_price / float(bps)
-
-        rows.append({
-            "code": code,
-            "name": info.get("name", ""),
-            "market": info.get("market", ""),
-            "current_price": safe_float(current_price),
-            "volume_ratio": safe_float(price.get("volume_ratio")),
-            "price_drop_pct": safe_float(price.get("price_drop_pct")),
-            "market_cap": market_cap,
-            "pbr": safe_float(pbr),
-            "updated_at": now,
-        })
-
-    upsert_batch("tob_stocks", rows, "code")
-    log.info(f"  {len(rows)} 銘柄の株価データを更新")
-
-
-# ---------------------------------------------------------------------------
-# Phase 3: 静的データ補完
-# ---------------------------------------------------------------------------
-def fetch_static_data(code: str, max_retries: int = 2) -> dict | None:
-    """1銘柄の静的データ（発行済株式数, BPS, BS）を個別取得。"""
-    ticker_str = f"{code}.T"
-    for attempt in range(max_retries + 1):
-        if attempt > 0:
-            time.sleep(1)
-        try:
-            tk = yf.Ticker(ticker_str)
-            info = tk.info
-
-            shares_outstanding = info.get("sharesOutstanding")
-            if not shares_outstanding or shares_outstanding == 0:
-                return None
-
-            bps = info.get("bookValue")
-
-            free_float_ratio = None
-            float_shares = info.get("floatShares")
-            if float_shares and shares_outstanding > 0:
-                free_float_ratio = float_shares / shares_outstanding
-
-            # バランスシートからネットキャッシュ比率を算出
-            net_cash_ratio = None
-            market_cap_info = info.get("marketCap")
-            bs = tk.balance_sheet
-            if bs is not None and not bs.empty and market_cap_info:
-                latest = bs.iloc[:, 0]
-                cash = latest.get("Cash And Cash Equivalents", 0) or 0
-                short_inv = latest.get("Other Short Term Investments", 0) or 0
-                long_inv = latest.get("Long Term Equity Investment", 0) or 0
-                securities = short_inv + long_inv
-                total_liabilities = latest.get("Total Liabilities Net Minority Interest", 0) or 0
-                net_cash = cash + securities * 0.7 - total_liabilities
-                net_cash_ratio = net_cash / market_cap_info
-
-            return {
-                "code": code,
-                "shares_outstanding": int(shares_outstanding),
-                "bps": safe_float(bps),
-                "net_cash_ratio": safe_float(net_cash_ratio),
-                "free_float_ratio": safe_float(free_float_ratio),
-            }
-        except Exception:
-            if attempt == max_retries:
-                return None
-    return None
 
 
 def fetch_all_rows(table: str, select: str, filter_fn=None) -> list[dict]:
@@ -339,68 +145,426 @@ def fetch_all_rows(table: str, select: str, filter_fn=None) -> list[dict]:
     return all_data
 
 
-def gap_fill_static(code_to_info: dict, is_quarterly_refresh: bool = False):
-    """NULLの銘柄だけ静的データを補完。四半期リフレッシュ時は古いデータも対象。"""
-    log.info("Phase 3: 静的データ補完")
+# ---------------------------------------------------------------------------
+# Phase 1: マスター同期 (J-Quants)
+# ---------------------------------------------------------------------------
+def master_sync() -> dict:
+    """J-Quants 銘柄マスターから全銘柄を同期。code_to_info を返す。"""
+    log.info("Phase 1: マスター同期 (J-Quants)")
+    rate_limiter.wait()
+    master = jquants_call(jquants.get_eq_master)
 
-    if is_quarterly_refresh:
-        first_of_month = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        data = fetch_all_rows(
-            "tob_stocks", "code",
-            lambda q: q.or_(f"static_updated_at.is.null,static_updated_at.lt.{first_of_month.isoformat()}"),
-        )
-        log.info("  四半期リフレッシュモード: 古い静的データも再取得対象")
-    else:
-        data = fetch_all_rows(
-            "tob_stocks", "code",
-            lambda q: q.or_("shares_outstanding.is.null,bps.is.null"),
-        )
+    target_markets = {"プライム", "スタンダード", "グロース"}
+    master = master[master["MktNm"].isin(target_markets)].copy()
+    master["code"] = master["Code"].str[:4]
+    # 同一4桁コードの重複を除去（最初のエントリを採用）
+    master = master.drop_duplicates(subset=["code"], keep="first")
 
-    if not data:
-        log.info("  補完対象の銘柄なし")
-        return
-
-    target_codes = [r["code"] for r in data]
-    log.info(f"  補完対象: {len(target_codes)} 銘柄")
+    log.info(f"  J-Quants 銘柄一覧: {len(master)} 銘柄")
 
     now = datetime.now(timezone.utc).isoformat()
-    results = []
-    done = 0
-    failed = 0
-    batch_size = 50
+    rows = []
+    code_to_info = {}
+    for _, r in master.iterrows():
+        code = r["code"]
+        name = r["CoName"]
+        market = r["MktNm"]
+        sector = r.get("S33Nm", "")
+        rows.append({
+            "code": code,
+            "name": name,
+            "market": market,
+            "sector_33": sector,
+            "updated_at": now,
+        })
+        code_to_info[code] = {"name": name, "market": market, "sector_33": sector}
 
-    for i in range(0, len(target_codes), batch_size):
-        batch = target_codes[i:i + batch_size]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(fetch_static_data, c): c for c in batch}
-            for future in as_completed(futures):
-                done += 1
-                code = futures[future]
-                result = future.result()
-                if result is not None:
-                    info = code_to_info.get(code, {})
-                    result["name"] = info.get("name", "")
-                    result["market"] = info.get("market", "")
-                    result["static_updated_at"] = now
-                    results.append(result)
-                else:
-                    failed += 1
-                if done % 100 == 0:
-                    log.info(f"  {done}/{len(target_codes)} 処理済 (成功: {len(results)}, 失敗: {failed})")
-
-        if i + batch_size < len(target_codes):
-            time.sleep(2)
-
-    if results:
-        upsert_batch("tob_stocks", results, "code")
-    log.info(f"  静的データ補完完了: {len(results)} 成功 / {failed} 失敗 / {len(target_codes)} 対象")
+    upsert_batch("tob_stocks", rows, "code", default_to_null=False)
+    log.info(f"  {len(rows)} 銘柄をマスター同期完了")
+    return code_to_info
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: 親会社情報更新
+# Phase 2: 株価更新 (J-Quants → price_history)
+# ---------------------------------------------------------------------------
+def get_trading_days() -> list[str]:
+    """J-Quants カレンダーから営業日一覧を取得 (YYYYMMDD 文字列)。"""
+    rate_limiter.wait()
+    cal = jquants_call(jquants.get_mkt_calendar)
+    biz = cal[cal["HolDiv"].astype(str) == "1"].copy()
+    dates = biz["Date"].sort_values().tolist()
+    return [d.strftime("%Y%m%d") if hasattr(d, "strftime") else str(d).replace("-", "")
+            for d in dates]
+
+
+def get_latest_price_date() -> str | None:
+    """price_history テーブルの最新日付 (YYYYMMDD)。"""
+    resp = (supabase.table("price_history")
+            .select("date")
+            .order("date", desc=True)
+            .limit(1)
+            .execute())
+    if resp.data:
+        return resp.data[0]["date"].replace("-", "")
+    return None
+
+
+def fetch_and_store_daily_prices(date_str: str) -> int:
+    """1日分の全銘柄株価を取得・保存。保存件数を返す。"""
+    rate_limiter.wait()
+    try:
+        prices = jquants_call(jquants.get_eq_bars_daily, date_yyyymmdd=date_str)
+    except Exception as e:
+        log.warning(f"  株価取得失敗 {date_str}: {e}")
+        return 0
+
+    if prices.empty:
+        return 0
+
+    rows = []
+    for _, r in prices.iterrows():
+        code = str(r["Code"])[:4]
+        close = safe_float(r.get("AdjC") or r.get("C"))
+        volume = safe_int(r.get("AdjVo") or r.get("Vo"))
+        if close is None:
+            continue
+        rows.append({
+            "code": code,
+            "date": str(r["Date"])[:10],
+            "close": close,
+            "volume": volume or 0,
+        })
+
+    # 同一 code+date の重複を除去
+    seen = set()
+    deduped = []
+    for r in rows:
+        key = (r["code"], r["date"])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(r)
+
+    if deduped:
+        upsert_batch("price_history", deduped, "code,date")
+    return len(deduped)
+
+
+def get_oldest_price_date() -> str | None:
+    """price_history テーブルの最古日付 (YYYYMMDD)。"""
+    resp = (supabase.table("price_history")
+            .select("date")
+            .order("date")
+            .limit(1)
+            .execute())
+    if resp.data:
+        return resp.data[0]["date"].replace("-", "")
+    return None
+
+
+def sync_price_history(trading_days: list[str]):
+    """price_history を最新まで同期（過去方向の欠落分も補完）。"""
+    log.info("Phase 2: 株価更新 (J-Quants)")
+
+    latest = get_latest_price_date()
+    oldest = get_oldest_price_date()
+
+    # 必要な営業日の範囲: 直近 PRICE_HISTORY_DAYS 日分
+    target_days = trading_days[-PRICE_HISTORY_DAYS:]
+
+    if latest and oldest:
+        # 未来方向の差分 + 過去方向の欠落分を収集
+        missing = [d for d in target_days if d > latest or d < oldest]
+        if not missing:
+            log.info(f"  株価データは最新です ({oldest}〜{latest})")
+            return
+        log.info(f"  差分/補完取得: {len(missing)} 日分 "
+                 f"(DB: {oldest}〜{latest})")
+    else:
+        missing = target_days
+        log.info(f"  初回ブートストラップ: {len(missing)} 日分")
+
+    total_stored = 0
+    for i, day in enumerate(missing):
+        n = fetch_and_store_daily_prices(day)
+        total_stored += n
+        if (i + 1) % 10 == 0:
+            log.info(f"  株価取得: {i + 1}/{len(missing)} 日完了 (累計 {total_stored} 件)")
+
+    log.info(f"  株価同期完了: {len(missing)} 日分, {total_stored} 件保存")
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: 財務データ更新 (J-Quants)
+# ---------------------------------------------------------------------------
+def get_latest_fin_date() -> str | None:
+    """tob_stocks.static_updated_at の最新日付 (YYYYMMDD)。"""
+    resp = (supabase.table("tob_stocks")
+            .select("static_updated_at")
+            .not_.is_("static_updated_at", "null")
+            .order("static_updated_at", desc=True)
+            .limit(1)
+            .execute())
+    if resp.data and resp.data[0].get("static_updated_at"):
+        return resp.data[0]["static_updated_at"][:10].replace("-", "")
+    return None
+
+
+def get_fin_coverage() -> int:
+    """tob_stocks で財務データ（total_assets）が設定されている銘柄数。"""
+    resp = (supabase.table("tob_stocks")
+            .select("code", count="exact")
+            .not_.is_("total_assets", "null")
+            .limit(1)
+            .execute())
+    return resp.count or 0
+
+
+def sync_financials(trading_days: list[str]):
+    """J-Quants 決算サマリーから財務データを更新。"""
+    log.info("Phase 3: 財務データ更新 (J-Quants)")
+
+    latest = get_latest_fin_date()
+    coverage = get_fin_coverage()
+    total_stocks = len(fetch_all_rows("tob_stocks", "code"))
+    coverage_pct = coverage / total_stocks * 100 if total_stocks else 0
+
+    # カバレッジが50%未満ならブートストラップ
+    needs_bootstrap = coverage_pct < 50
+    if latest and not needs_bootstrap:
+        target_days = [d for d in trading_days if d > latest]
+        if not target_days:
+            log.info(f"  財務データは最新です (カバレッジ: {coverage}/{total_stocks} = {coverage_pct:.0f}%)")
+            return
+        target_days = target_days[-FIN_DAILY_MAX_DAYS:]
+        log.info(f"  差分取得: {len(target_days)} 日分 (最終更新: {latest}, "
+                 f"カバレッジ: {coverage}/{total_stocks})")
+    else:
+        target_days = trading_days[-FIN_BOOTSTRAP_DAYS:]
+        log.info(f"  ブートストラップ: {len(target_days)} 日分 "
+                 f"(カバレッジ: {coverage}/{total_stocks} = {coverage_pct:.0f}%)")
+
+    all_fins = []
+    for i, day in enumerate(target_days):
+        rate_limiter.wait()
+        try:
+            fin = jquants_call(jquants.get_fin_summary, date_yyyymmdd=day)
+            if not fin.empty:
+                all_fins.append(fin)
+        except Exception as e:
+            log.warning(f"  財務取得失敗 {day}: {e}")
+        if (i + 1) % 10 == 0:
+            log.info(f"  財務取得: {i + 1}/{len(target_days)} 日完了")
+
+    if not all_fins:
+        log.info("  新規財務データなし")
+        return
+
+    fins = pd.concat(all_fins, ignore_index=True)
+    fins["code"] = fins["Code"].str[:4]
+
+    # 各銘柄の最新決算のみ残す（FY決算 > 四半期決算を優先）
+    # DocType に "FY" が含まれるものを優先的に残す
+    fins["is_fy"] = fins["DocType"].str.contains("FY", na=False).astype(int)
+    fins = fins.sort_values(["code", "is_fy", "DiscDate"]).drop_duplicates(
+        subset=["code"], keep="last"
+    )
+
+    # tob_stocks に存在し、name があるコードのみ対象（NOT NULL制約回避）
+    existing = fetch_all_rows("tob_stocks", "code, name, market")
+    existing_map = {r["code"]: r for r in existing if r.get("name")}
+    existing_codes = set(existing_map.keys())
+
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for _, r in fins.iterrows():
+        code = r["code"]
+        if code not in existing_codes:
+            continue
+
+        shares = safe_int(r.get("ShOutFY"))
+        if not shares or shares == 0:
+            continue
+
+        bps = safe_float(r.get("BPS"))
+        eps = safe_float(r.get("EPS"))
+        eq_ratio = safe_float(r.get("EqAR"))
+        ta = safe_int(r.get("TA"))
+        eq = safe_int(r.get("Eq"))
+        cash_eq = safe_int(r.get("CashEq"))
+
+        info = existing_map[code]
+        row = {
+            "code": code,
+            "name": info["name"],
+            "market": info["market"],
+            "shares_outstanding": shares,
+            "bps": bps,
+            "eps": eps,
+            "equity_ratio": eq_ratio,
+            "total_assets": ta,
+            "equity": eq,
+            "cash_equivalents": cash_eq,
+            "static_updated_at": now,
+        }
+        rows.append(row)
+
+    if rows:
+        upsert_batch("tob_stocks", rows, "code", default_to_null=False)
+    log.info(f"  財務データ更新完了: {len(rows)} 銘柄")
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: 指標算出 (price_history + 財務データ → tob_stocks)
+# ---------------------------------------------------------------------------
+def fetch_all_rows_large(table: str, select: str, filter_fn=None) -> list[dict]:
+    """大量データ用の全行取得（count付きで確実に全件取得）。"""
+    # まず総件数を取得
+    count_q = supabase.table(table).select(select, count="exact").limit(1)
+    if filter_fn:
+        count_q = filter_fn(count_q)
+    total = count_q.execute().count or 0
+    if total == 0:
+        return []
+
+    page_size = 1000  # Supabase のデフォルト上限
+    all_data = []
+    offset = 0
+    while offset < total:
+        query = supabase.table(table).select(select).range(offset, offset + page_size - 1)
+        if filter_fn:
+            query = filter_fn(query)
+        resp = query.execute()
+        if not resp.data:
+            break
+        all_data.extend(resp.data)
+        offset += page_size
+        if offset % 100000 == 0:
+            log.info(f"  データ読み込み中: {len(all_data)}/{total} 件...")
+    return all_data
+
+
+def compute_and_update_metrics(code_to_info: dict):
+    """price_history と tob_stocks の財務データから指標を算出して更新。"""
+    log.info("Phase 4: 指標算出")
+
+    # 1. price_history から全データを読み込み
+    all_prices = fetch_all_rows_large("price_history", "code, date, close, volume")
+    if not all_prices:
+        log.warning("  price_history にデータがありません")
+        return
+    log.info(f"  price_history: {len(all_prices)} 件読み込み完了")
+
+    pdf = pd.DataFrame(all_prices)
+    pdf["close"] = pd.to_numeric(pdf["close"], errors="coerce")
+    pdf["volume"] = pd.to_numeric(pdf["volume"], errors="coerce")
+    pdf = pdf.sort_values(["code", "date"])
+
+    # 銘柄ごとに指標を算出
+    price_metrics = {}
+    for code, grp in pdf.groupby("code"):
+        close = grp["close"].dropna()
+        volume = grp["volume"].dropna()
+        if close.empty:
+            continue
+
+        current_price = float(close.iloc[-1])
+
+        volume_ratio = None
+        if len(volume) >= 10:
+            avg_5d = volume.tail(5).mean()
+            avg_60d = volume.tail(60).mean() if len(volume) >= 60 else volume.mean()
+            if avg_60d > 0:
+                volume_ratio = float(avg_5d / avg_60d)
+
+        price_drop_pct = None
+        high_52w = float(close.max())
+        if high_52w > 0:
+            price_drop_pct = (high_52w - current_price) / high_52w
+
+        price_metrics[code] = {
+            "current_price": current_price,
+            "volume_ratio": volume_ratio,
+            "price_drop_pct": price_drop_pct,
+        }
+
+    log.info(f"  価格指標算出: {len(price_metrics)} 銘柄")
+
+    # 2. tob_stocks から財務データ + name/market を読み込み
+    fin_data = fetch_all_rows(
+        "tob_stocks",
+        "code, name, market, shares_outstanding, bps, total_assets, equity, cash_equivalents"
+    )
+    fin_map = {r["code"]: r for r in fin_data}
+
+    # 3. tob_stocks に存在する銘柄コード一覧を取得
+    existing_codes = set(r["code"] for r in fin_data)
+
+    # 4. 統合して更新
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for code, pm in price_metrics.items():
+        # tob_stocks に登録済みかつ name がある銘柄のみ対象
+        if code not in existing_codes:
+            continue
+        fin = fin_map.get(code, {})
+        if not fin.get("name"):
+            continue
+        current_price = pm["current_price"]
+        shares = fin.get("shares_outstanding")
+        bps_val = safe_float(fin.get("bps"))
+
+        # BPS が未取得の場合、equity / shares で算出
+        if bps_val is None and shares and shares > 0:
+            eq_val = safe_float(fin.get("equity"))
+            if eq_val:
+                bps_val = eq_val / shares
+
+        market_cap = int(current_price * shares) if shares else None
+        # PostgreSQL bigint 上限チェック (bad data 回避)
+        if market_cap and market_cap > 9_000_000_000_000_000_000:
+            market_cap = None
+        pbr = current_price / bps_val if bps_val and bps_val > 0 else None
+
+        # net_cash_ratio = (現金同等物 - 総負債) / 時価総額
+        # CashEq が FY データにのみ存在するため、ない場合は自己資本比率で近似
+        net_cash_ratio = None
+        ta = safe_float(fin.get("total_assets"))
+        eq = safe_float(fin.get("equity"))
+        cash = safe_float(fin.get("cash_equivalents"))
+        if market_cap and ta and eq:
+            total_liabilities = ta - eq
+            if cash is not None and cash > 0:
+                net_cash = cash - total_liabilities
+            else:
+                # CashEq 不明時: 自己資本 - 負債 の半分を近似値として使用
+                # (保守的: 資産の流動性を考慮して割り引き)
+                net_cash = eq * 0.5 - total_liabilities * 0.5
+            net_cash_ratio = net_cash / market_cap
+
+        row = {
+            "code": code,
+            "name": fin["name"],
+            "market": fin["market"],
+            "current_price": safe_float(current_price),
+            "volume_ratio": safe_float(pm["volume_ratio"]),
+            "price_drop_pct": safe_float(pm["price_drop_pct"]),
+            "market_cap": market_cap,
+            "pbr": safe_float(pbr),
+            "net_cash_ratio": safe_float(net_cash_ratio),
+            "updated_at": now,
+        }
+        rows.append(row)
+
+    if rows:
+        upsert_batch("tob_stocks", rows, "code", default_to_null=False)
+    log.info(f"  指標更新完了: {len(rows)} 銘柄 "
+             f"(market_cap算出: {sum(1 for r in rows if r['market_cap'])})")
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: 親会社情報更新 (yfinance - 据置)
 # ---------------------------------------------------------------------------
 def check_activist_holders(code: str) -> tuple[bool, list[str]]:
-    """アクティビストファンドの保有判定。"""
     try:
         tk = yf.Ticker(f"{code}.T")
         holders = tk.institutional_holders
@@ -421,7 +585,7 @@ def check_activist_holders(code: str) -> tuple[bool, list[str]]:
 
 def update_parent_extra():
     """親会社の追加情報（PBR・アクティビスト）を更新。"""
-    log.info("Phase 4: 親会社情報更新")
+    log.info("Phase 5: 親会社情報更新")
 
     ps_resp = supabase.table("parent_subsidiary").select("parent_code").execute()
     if not ps_resp.data:
@@ -430,7 +594,6 @@ def update_parent_extra():
 
     parent_codes = list({r["parent_code"] for r in ps_resp.data})
 
-    # 親会社PBRをtob_stocksから取得
     pbr_resp = supabase.table("tob_stocks").select("code, pbr").execute()
     code_to_pbr = {r["code"]: r.get("pbr") for r in pbr_resp.data} if pbr_resp.data else {}
 
@@ -456,7 +619,6 @@ def update_parent_extra():
                 })
                 if done % 20 == 0:
                     log.info(f"  親会社 {done}/{len(parent_codes)} 処理済")
-
         if i + batch_size < len(parent_codes):
             time.sleep(1)
 
@@ -470,24 +632,26 @@ def update_parent_extra():
 # ---------------------------------------------------------------------------
 def main():
     start = time.time()
-    log.info("=== TOB データ更新開始 (v2) ===")
+    log.info("=== TOB データ更新開始 (v3 - J-Quants) ===")
 
     # Phase 1: マスター同期
-    jpx_df = fetch_jpx_list()
-    master_sync(jpx_df)
-    codes = jpx_df["code"].tolist()
-    code_to_info = {r["code"]: {"name": r["name"], "market": r["market"]} for _, r in jpx_df.iterrows()}
+    code_to_info = master_sync()
 
-    # Phase 2: 一括株価更新
-    price_data = bulk_download_prices(codes)
-    update_prices(codes, price_data, code_to_info)
+    # 営業日カレンダー取得
+    trading_days = get_trading_days()
+    log.info(f"  営業日カレンダー: {len(trading_days)} 日 "
+             f"({trading_days[0]}〜{trading_days[-1]})")
 
-    # Phase 3: 静的データ補完
-    current_month = datetime.now(timezone.utc).month
-    is_quarterly = current_month in QUARTERLY_MONTHS
-    gap_fill_static(code_to_info, is_quarterly_refresh=is_quarterly)
+    # Phase 2: 株価更新
+    sync_price_history(trading_days)
 
-    # Phase 4: 親会社情報更新
+    # Phase 3: 財務データ更新
+    sync_financials(trading_days)
+
+    # Phase 4: 指標算出
+    compute_and_update_metrics(code_to_info)
+
+    # Phase 5: 親会社情報更新
     update_parent_extra()
 
     elapsed = time.time() - start
