@@ -182,19 +182,12 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
             if pd.notna(max_ratio):
                 df.loc[mask, "edinet_max_ratio"] = max_ratio
 
-            # アクティビスト判定
+            # アクティビスト判定（EDINET大量保有報告書ベース）
             activist_rows = code_holders[code_holders["is_activist"] == True]
             if not activist_rows.empty:
                 df.loc[mask, "edinet_activist"] = True
                 names = activist_rows["filer_name"].unique().tolist()
                 df.loc[mask, "edinet_activist_names"] = ", ".join(names)
-
-                # EDINET のアクティビスト情報で既存フラグも補完
-                if not df.loc[mask, "activist_in_parent"].any():
-                    df.loc[mask, "activist_in_parent"] = True
-                    existing_names = df.loc[mask, "activist_names"].iloc[0]
-                    combined = ", ".join(filter(None, [existing_names, ", ".join(names)]))
-                    df.loc[mask, "activist_names"] = combined
 
     return df
 
@@ -421,15 +414,15 @@ def main():
         col2.metric("スコア70以上", f"{(view['tob_score'] >= 70).sum()}")
         col3.metric("スコア50以上", f"{(view['tob_score'] >= 50).sum()}")
         col4.metric("親子上場", f"{view['top_sh_code'].notna().sum()}")
-        col5.metric("親アクティビスト", f"{view['activist_in_parent'].sum()}")
-        col6.metric("EDINET大量保有", f"{(view['edinet_holder_count'] > 0).sum()}")
+        col5.metric("親にアクティビスト", f"{view['activist_in_parent'].sum()}")
+        col6.metric("アクティビスト介入", f"{view['edinet_activist'].sum()}")
 
         display = view[["code", "name", "market", "tob_score", "pbr",
                          "net_cash_ratio", "market_cap", "volume_ratio",
                          "price_drop_pct", "top_sh_name", "top_sh_pct",
                          "parent_pbr", "free_float_ratio", "activist_in_parent",
-                         "activist_names", "edinet_holder_count",
-                         "edinet_max_ratio"]].copy()
+                         "edinet_activist", "edinet_activist_names",
+                         "edinet_holder_count", "edinet_max_ratio"]].copy()
         display.insert(0, "順位", range(1, len(display) + 1))
         display["tob_score"] = display["tob_score"].round(1)
         display["pbr"] = display["pbr"].round(2)
@@ -450,7 +443,10 @@ def main():
         display["activist_in_parent"] = display["activist_in_parent"].map(
             {True: "○", False: ""}
         ).fillna("")
-        display["activist_names"] = display["activist_names"].fillna("")
+        display["edinet_activist"] = display["edinet_activist"].map(
+            {True: "○", False: ""}
+        ).fillna("")
+        display["edinet_activist_names"] = display["edinet_activist_names"].fillna("")
         display["edinet_max_ratio"] = display["edinet_max_ratio"].apply(
             lambda x: f"{x*100:.1f}%" if pd.notna(x) else ""
         )
@@ -459,8 +455,8 @@ def main():
             "順位", "コード", "銘柄名", "市場区分", "TOBスコア", "PBR",
             "NC比率(%)", "時価総額(億円)", "出来高倍率", "52週高値乖離(%)",
             "親会社", "支配株主比率", "親会社PBR", "流動株比率",
-            "アクティビスト", "アクティビスト名", "大量保有報告数",
-            "最大保有割合",
+            "親にアクティビスト", "アクティビスト介入",
+            "アクティビスト名", "大量保有報告数", "最大保有割合",
         ]
 
         st.subheader("TOBスコア ランキング")
