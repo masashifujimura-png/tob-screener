@@ -86,6 +86,21 @@ def load_parent_extra() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
+def load_edinet_shareholders() -> pd.DataFrame:
+    """edinet_shareholders テーブルから大株主データを読み込む。"""
+    data = _fetch_all("edinet_shareholders")
+    if not data:
+        return pd.DataFrame(columns=[
+            "code", "rank", "shareholder_name", "holding_ratio",
+            "shares_held", "report_date", "is_activist",
+        ])
+    df = pd.DataFrame(data)
+    df["holding_ratio"] = pd.to_numeric(df["holding_ratio"], errors="coerce")
+    df["shares_held"] = pd.to_numeric(df["shares_held"], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=3600)
 def load_edinet_holders() -> pd.DataFrame:
     """edinet_holders テーブルから大量保有報告書データを読み込む。"""
     data = _fetch_all("edinet_holders")
@@ -351,6 +366,7 @@ def main():
     ps_df = load_parent_subsidiary()
     pe_df = load_parent_extra()
     edinet_df = load_edinet_holders()
+    edinet_sh_df = load_edinet_shareholders()
     df = merge_all(stocks, ps_df, pe_df, edinet_df)
 
     updated_at = stocks["updated_at"].max() if "updated_at" in stocks.columns else "不明"
@@ -497,6 +513,18 @@ def main():
                             st.markdown(f"- 最大保有割合: **{max_ratio*100:.1f}%**")
                         if sel_row.get("edinet_activist"):
                             st.markdown(f"- EDINET アクティビスト: **{sel_row['edinet_activist_names']}**")
+
+                # 大株主テーブル（EDINET 有価証券報告書）
+                sel_shareholders = edinet_sh_df[edinet_sh_df["code"] == sel_code].sort_values("rank")
+                if not sel_shareholders.empty:
+                    st.markdown("**大株主の状況（有価証券報告書）**")
+                    sh_display = sel_shareholders[["rank", "shareholder_name", "holding_ratio", "is_activist"]].copy()
+                    sh_display["holding_ratio"] = sh_display["holding_ratio"].apply(
+                        lambda x: f"{x*100:.2f}%" if pd.notna(x) else ""
+                    )
+                    sh_display["is_activist"] = sh_display["is_activist"].map({True: "★", False: ""}).fillna("")
+                    sh_display.columns = ["順位", "株主名", "保有比率", "アクティビスト"]
+                    st.dataframe(sh_display, use_container_width=True, hide_index=True)
 
                 price_fig = make_price_chart(sel_code)
                 if price_fig:

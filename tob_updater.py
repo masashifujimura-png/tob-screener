@@ -6,6 +6,7 @@ Phase 3: 財務更新   — J-Quants 決算サマリー → tob_stocks
 Phase 4: 指標算出   — price_history + 財務データ → market_cap / pbr / net_cash_ratio
 Phase 5: 親会社情報 — yfinance アクティビスト判定（据置）
 Phase 6: EDINET    — 大量保有報告書 → edinet_holders (アクティビスト検出強化)
+Phase 7: EDINET    — 有価証券報告書 → キャッシュフロー + 大株主構成
 """
 
 import os
@@ -868,6 +869,272 @@ def sync_edinet_holders():
 
 
 # ---------------------------------------------------------------------------
+# Phase 7: EDINET 有価証券報告書 (キャッシュフロー + 株主構成)
+# ---------------------------------------------------------------------------
+YUHO_BOOTSTRAP_DAYS = 365   # 初回: 過去1年（年次報告をカバー）
+YUHO_DAILY_DAYS = 7         # 日次: 過去7日分
+
+
+def parse_yuho_csv(zip_bytes: bytes) -> dict | None:
+    """有価証券報告書 CSV ZIP からキャッシュフロー・株主データを抽出。"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            csv_files = [f for f in zf.namelist()
+                         if 'jpcrp' in f and f.endswith('.csv')]
+            if not csv_files:
+                return None
+
+            with zf.open(csv_files[0]) as f:
+                content = f.read().decode('utf-16', errors='ignore')
+
+        lines = content.split('\n')
+        result = {
+            'cash_equivalents': None,
+            'operating_cf': None,
+            'foreign_ownership_ratio': None,
+            'shareholders': [],   # [{rank, name, ratio, shares}]
+        }
+
+        # 株主名とランクの一時格納
+        names = {}   # rank -> name
+        ratios = {}  # rank -> ratio
+        shares = {}  # rank -> shares_held
+
+        for line in lines:
+            parts = line.split('\t')
+            if len(parts) < 9:
+                continue
+
+            elem = parts[0].strip().strip('"')
+            context = parts[2].strip().strip('"') if len(parts) > 2 else ''
+            value = parts[8].strip().strip('"') if len(parts) > 8 else ''
+
+            if not value or value == '－':
+                # 名前は値が空でないことが多いが、数値データが「－」の場合はスキップ
+                if 'NameMajorShareholders' not in elem:
+                    continue
+
+            # --- キャッシュフロー（Summary でない詳細版を優先）---
+            if 'CurrentYear' not in context:
+                continue
+
+            # 現金同等物
+            if ('jppfs_cor:CashAndCashEquivalents' == elem
+                    and 'CurrentYearInstant' in context
+                    and 'NonConsolidated' not in context):
+                try:
+                    result['cash_equivalents'] = int(value)
+                except (ValueError, TypeError):
+                    pass
+
+            # 営業CF
+            if ('jppfs_cor:NetCashProvidedByUsedInOperatingActivities' == elem
+                    and 'CurrentYear' in context
+                    and 'NonConsolidated' not in context):
+                try:
+                    result['operating_cf'] = int(value)
+                except (ValueError, TypeError):
+                    pass
+
+            # 外国人持株比率
+            if 'PercentageOfShareholdingsForeigners' in elem and value:
+                try:
+                    v = float(value)
+                    # 複数あれば合算（個人以外 + 個人）
+                    if result['foreign_ownership_ratio'] is None:
+                        result['foreign_ownership_ratio'] = v
+                    else:
+                        result['foreign_ownership_ratio'] += v
+                except (ValueError, TypeError):
+                    pass
+
+            # 大株主名
+            if 'NameMajorShareholders' in elem:
+                rank_m = re.search(r'No(\d+)', context)
+                if rank_m and value and value != '－':
+                    names[int(rank_m.group(1))] = value.strip()
+
+            # 大株主保有比率
+            if 'jpcrp_cor:ShareholdingRatio' == elem and 'MajorShareholder' in context:
+                rank_m = re.search(r'No(\d+)', context)
+                if rank_m and value:
+                    try:
+                        ratios[int(rank_m.group(1))] = float(value)
+                    except (ValueError, TypeError):
+                        pass
+
+            # 大株主株数
+            if 'jpcrp_cor:NumberOfSharesHeld' == elem and 'MajorShareholder' in context:
+                rank_m = re.search(r'No(\d+)', context)
+                if rank_m and value:
+                    try:
+                        shares[int(rank_m.group(1))] = int(value)
+                    except (ValueError, TypeError):
+                        pass
+
+        # 株主データを統合
+        for rank in sorted(set(names.keys()) | set(ratios.keys())):
+            if rank not in names:
+                continue
+            sh = {
+                'rank': rank,
+                'name': names[rank],
+                'ratio': ratios.get(rank),
+                'shares': shares.get(rank),
+            }
+            result['shareholders'].append(sh)
+
+        return result
+    except (zipfile.BadZipFile, UnicodeDecodeError):
+        return None
+    except Exception as e:
+        log.debug(f"  有報CSV解析エラー: {e}")
+        return None
+
+
+def get_latest_yuho_date() -> str | None:
+    """tob_stocks.yuho_date の最新日付。"""
+    resp = (supabase.table("tob_stocks")
+            .select("yuho_date")
+            .not_.is_("yuho_date", "null")
+            .order("yuho_date", desc=True)
+            .limit(1)
+            .execute())
+    if resp.data and resp.data[0].get("yuho_date"):
+        return resp.data[0]["yuho_date"]
+    return None
+
+
+def sync_edinet_yuho():
+    """Phase 7: EDINET 有価証券報告書の同期（キャッシュフロー + 株主構成）。"""
+    if not EDINET_API_KEY:
+        log.info("Phase 7: EDINET_API_KEY 未設定、スキップ")
+        return
+
+    log.info("Phase 7: EDINET 有価証券報告書同期（CF + 株主構成）")
+
+    # 対象銘柄コード一覧
+    stocks = fetch_all_rows("tob_stocks", "code, name, market")
+    valid_codes = {r["code"]: r for r in stocks if r.get("name")}
+
+    # 既にyuho_dateがある銘柄は処理済み（日次更新時にスキップ判定用）
+    latest_yuho = get_latest_yuho_date()
+    today = datetime.now(timezone.utc).date()
+
+    if latest_yuho:
+        # 差分更新: 最終更新日の翌日から
+        start_date = datetime.strptime(latest_yuho, "%Y-%m-%d").date() + timedelta(days=1)
+        if start_date > today:
+            log.info("  有報データは最新です")
+            return
+        days_to_fetch = min((today - start_date).days + 1, YUHO_DAILY_DAYS)
+        log.info(f"  差分取得: {start_date} 〜 (最大 {days_to_fetch} 日)")
+    else:
+        days_to_fetch = YUHO_BOOTSTRAP_DAYS
+        start_date = today - timedelta(days=days_to_fetch - 1)
+        log.info(f"  ブートストラップ: 過去 {days_to_fetch} 日分")
+
+    # 処理済み doc_id 追跡（銘柄ごとに最新1件のみ処理）
+    processed_codes = set()
+    total_found = 0
+    total_parsed = 0
+
+    # 新しい日付から逆順に処理（最新の有報を優先）
+    for day_offset in range(days_to_fetch - 1, -1, -1):
+        target_date = start_date + timedelta(days=day_offset)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        try:
+            docs = edinet_get_documents(date_str)
+        except Exception as e:
+            log.warning(f"  EDINET 書類一覧取得失敗 {date_str}: {e}")
+            time.sleep(1)
+            continue
+
+        # 有価証券報告書 (120) でセキュリティコードありのみ
+        yuho_docs = [
+            d for d in docs
+            if d.get("docTypeCode") == "120"
+            and d.get("secCode")
+            and d.get("csvFlag") == "1"
+        ]
+
+        for doc in yuho_docs:
+            sec_code = doc["secCode"][:4]
+            if sec_code not in valid_codes or sec_code in processed_codes:
+                continue
+
+            total_found += 1
+
+            # CSV ダウンロード
+            try:
+                csv_resp = requests.get(
+                    f"{EDINET_API_BASE}/documents/{doc['docID']}",
+                    params={"type": 5, "Subscription-Key": EDINET_API_KEY},
+                    timeout=120,
+                )
+                if csv_resp.status_code != 200:
+                    continue
+            except Exception as e:
+                log.warning(f"  CSV ダウンロード失敗 {doc['docID']}: {e}")
+                continue
+
+            parsed = parse_yuho_csv(csv_resp.content)
+            if not parsed:
+                time.sleep(0.5)
+                continue
+
+            info = valid_codes[sec_code]
+            now = datetime.now(timezone.utc).isoformat()
+
+            # tob_stocks 更新（キャッシュフロー + 外国人持株比率）
+            update_row = {
+                "code": sec_code,
+                "name": info["name"],
+                "market": info["market"],
+                "yuho_date": date_str,
+            }
+            if parsed['cash_equivalents'] is not None:
+                update_row['cash_equivalents'] = parsed['cash_equivalents']
+            if parsed['operating_cf'] is not None:
+                update_row['operating_cf'] = parsed['operating_cf']
+            if parsed['foreign_ownership_ratio'] is not None:
+                update_row['foreign_ownership_ratio'] = parsed['foreign_ownership_ratio']
+
+            upsert_batch("tob_stocks", [update_row], "code", default_to_null=False)
+
+            # 大株主データ保存
+            if parsed['shareholders']:
+                sh_rows = []
+                for sh in parsed['shareholders']:
+                    is_activist = check_activist_name(sh['name'])
+                    sh_rows.append({
+                        "code": sec_code,
+                        "rank": sh['rank'],
+                        "shareholder_name": sh['name'],
+                        "holding_ratio": sh.get('ratio'),
+                        "shares_held": sh.get('shares'),
+                        "report_date": date_str,
+                        "is_activist": is_activist,
+                    })
+                upsert_batch("edinet_shareholders", sh_rows, "code,rank")
+
+            processed_codes.add(sec_code)
+            total_parsed += 1
+
+            time.sleep(0.5)
+
+        if (days_to_fetch - day_offset) % 30 == 0:
+            log.info(f"  有報取得: {days_to_fetch - day_offset}/{days_to_fetch} 日完了 "
+                     f"(発見: {total_found}, 解析: {total_parsed})")
+
+        time.sleep(0.3)
+
+    log.info(f"  有報同期完了: {total_found} 件発見, {total_parsed} 件解析・保存 "
+             f"(対象銘柄: {len(processed_codes)})")
+
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 def main():
@@ -896,6 +1163,9 @@ def main():
 
     # Phase 6: EDINET 大量保有報告書
     sync_edinet_holders()
+
+    # Phase 7: EDINET 有価証券報告書
+    sync_edinet_yuho()
 
     elapsed = time.time() - start
     log.info(f"=== TOB データ更新完了 ({elapsed:.0f}秒) ===")
