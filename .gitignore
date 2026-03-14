@@ -6,4 +6,5 @@ __pycache__/
 .streamlit/secrets.toml
 phase3_4_output.log
 run_phase3_4.py
+run_edinet.py
 tob_backtest_results.csv

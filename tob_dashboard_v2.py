@@ -85,10 +85,25 @@ def load_parent_extra() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(ttl=3600)
+def load_edinet_holders() -> pd.DataFrame:
+    """edinet_holders テーブルから大量保有報告書データを読み込む。"""
+    data = _fetch_all("edinet_holders")
+    if not data:
+        return pd.DataFrame(columns=[
+            "doc_id", "code", "filer_name", "holding_ratio",
+            "purpose", "report_date", "doc_type_code", "is_activist",
+        ])
+    df = pd.DataFrame(data)
+    df["holding_ratio"] = pd.to_numeric(df["holding_ratio"], errors="coerce")
+    return df
+
+
 # ---------------------------------------------------------------------------
 # データ結合
 # ---------------------------------------------------------------------------
-def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame) -> pd.DataFrame:
+def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
+              edinet: pd.DataFrame = None) -> pd.DataFrame:
     df = stocks.copy()
 
     # 親子上場マージ
@@ -126,6 +141,46 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame) -> pd.Da
         df["activist_in_parent"] = False
         df["activist_names"] = ""
 
+    # EDINET 大量保有報告書マージ
+    df["edinet_activist"] = False
+    df["edinet_activist_names"] = ""
+    df["edinet_max_ratio"] = None
+    df["edinet_holder_count"] = 0
+
+    if edinet is not None and not edinet.empty:
+        # 各銘柄ごとにファイラー別の最新報告のみ残す
+        edinet_sorted = edinet.sort_values("report_date", ascending=False)
+        latest_per_filer = edinet_sorted.drop_duplicates(
+            subset=["code", "filer_name"], keep="first"
+        )
+
+        for code in df["code"].unique():
+            code_holders = latest_per_filer[latest_per_filer["code"] == code]
+            if code_holders.empty:
+                continue
+
+            mask = df["code"] == code
+            df.loc[mask, "edinet_holder_count"] = len(code_holders)
+
+            # 最大保有割合
+            max_ratio = code_holders["holding_ratio"].max()
+            if pd.notna(max_ratio):
+                df.loc[mask, "edinet_max_ratio"] = max_ratio
+
+            # アクティビスト判定
+            activist_rows = code_holders[code_holders["is_activist"] == True]
+            if not activist_rows.empty:
+                df.loc[mask, "edinet_activist"] = True
+                names = activist_rows["filer_name"].unique().tolist()
+                df.loc[mask, "edinet_activist_names"] = ", ".join(names)
+
+                # EDINET のアクティビスト情報で既存フラグも補完
+                if not df.loc[mask, "activist_in_parent"].any():
+                    df.loc[mask, "activist_in_parent"] = True
+                    existing_names = df.loc[mask, "activist_names"].iloc[0]
+                    combined = ", ".join(filter(None, [existing_names, ", ".join(names)]))
+                    df.loc[mask, "activist_names"] = combined
+
     return df
 
 
@@ -161,6 +216,13 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
         np.where(top_pct > 0, np.clip(top_pct / 50, 0, 1) * 100, 50),
     )
 
+    # Activist Score: EDINET 大量保有報告書ベースのアクティビスト検出
+    # アクティビスト介入あり = 100点、大量保有報告書あり = 30点、なし = 0点
+    out["score_activist"] = np.where(
+        out["edinet_activist"] | out["activist_in_parent"], 100,
+        np.where(out["edinet_holder_count"] > 0, 30, 0),
+    )
+
     w_total = sum(weights.values())
     out["tob_score"] = (
         out["score_pbr"] * weights["pbr"]
@@ -169,6 +231,7 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
         + out["score_volume"] * weights["volume"]
         + out["score_pricedrop"] * weights["pricedrop"]
         + out["score_top_sh"] * weights["top_sh"]
+        + out["score_activist"] * weights.get("activist", 0)
     ) / w_total
 
     return out
@@ -178,10 +241,11 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
 # レーダーチャート
 # ---------------------------------------------------------------------------
 def make_radar_chart(row: pd.Series) -> go.Figure:
-    categories = ["PBR割安", "ネットキャッシュ", "低時価総額", "出来高急増", "株価下落", "親子上場"]
+    categories = ["PBR割安", "ネットキャッシュ", "低時価総額", "出来高急増", "株価下落", "親子上場", "アクティビスト"]
     values = [
         row["score_pbr"], row["score_nc"], row["score_smallcap"],
         row["score_volume"], row["score_pricedrop"], row["score_top_sh"],
+        row.get("score_activist", 0),
     ]
     values_closed = values + [values[0]]
     categories_closed = categories + [categories[0]]
@@ -286,7 +350,8 @@ def main():
 
     ps_df = load_parent_subsidiary()
     pe_df = load_parent_extra()
-    df = merge_all(stocks, ps_df, pe_df)
+    edinet_df = load_edinet_holders()
+    df = merge_all(stocks, ps_df, pe_df, edinet_df)
 
     updated_at = stocks["updated_at"].max() if "updated_at" in stocks.columns else "不明"
     st.caption(f"最終更新: {updated_at}　|　取得銘柄数: {len(df)}　|　親子上場: {len(ps_df)} ペア登録")
@@ -306,10 +371,12 @@ def main():
     w_volume = st.sidebar.slider("出来高急増", 0, 50, 5)
     w_pricedrop = st.sidebar.slider("株価下落(52週高値比)", 0, 50, 25)
     w_top_sh = st.sidebar.slider("親子上場", 0, 50, 20)
+    w_activist = st.sidebar.slider("アクティビスト(EDINET)", 0, 50, 15)
 
     weights = {
         "pbr": w_pbr, "nc": w_nc, "smallcap": w_smallcap,
         "volume": w_volume, "pricedrop": w_pricedrop, "top_sh": w_top_sh,
+        "activist": w_activist,
     }
 
     if st.sidebar.button("キャッシュクリア"):
@@ -333,18 +400,20 @@ def main():
     # タブ1: TOBスクリーニング
     # =================================================================
     with tab_screening:
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         col1.metric("対象銘柄数", f"{len(view)}")
         col2.metric("スコア70以上", f"{(view['tob_score'] >= 70).sum()}")
         col3.metric("スコア50以上", f"{(view['tob_score'] >= 50).sum()}")
         col4.metric("親子上場", f"{view['top_sh_code'].notna().sum()}")
         col5.metric("親アクティビスト", f"{view['activist_in_parent'].sum()}")
+        col6.metric("EDINET大量保有", f"{(view['edinet_holder_count'] > 0).sum()}")
 
         display = view[["code", "name", "market", "tob_score", "pbr",
                          "net_cash_ratio", "market_cap", "volume_ratio",
                          "price_drop_pct", "top_sh_name", "top_sh_pct",
                          "parent_pbr", "free_float_ratio", "activist_in_parent",
-                         "activist_names"]].copy()
+                         "activist_names", "edinet_holder_count",
+                         "edinet_max_ratio"]].copy()
         display.insert(0, "順位", range(1, len(display) + 1))
         display["tob_score"] = display["tob_score"].round(1)
         display["pbr"] = display["pbr"].round(2)
@@ -366,12 +435,16 @@ def main():
             {True: "○", False: ""}
         ).fillna("")
         display["activist_names"] = display["activist_names"].fillna("")
+        display["edinet_max_ratio"] = display["edinet_max_ratio"].apply(
+            lambda x: f"{x*100:.1f}%" if pd.notna(x) else ""
+        )
 
         display.columns = [
             "順位", "コード", "銘柄名", "市場区分", "TOBスコア", "PBR",
             "NC比率(%)", "時価総額(億円)", "出来高倍率", "52週高値乖離(%)",
             "親会社", "支配株主比率", "親会社PBR", "流動株比率",
-            "アクティビスト", "アクティビスト名",
+            "アクティビスト", "アクティビスト名", "大量保有報告数",
+            "最大保有割合",
         ]
 
         st.subheader("TOBスコア ランキング")
@@ -414,6 +487,16 @@ def main():
                             st.markdown("- 親会社にアクティビスト: なし")
                     else:
                         st.markdown("- 親子上場: 該当なし")
+
+                    # EDINET 大量保有報告書情報
+                    edinet_count = sel_row.get("edinet_holder_count", 0)
+                    if edinet_count > 0:
+                        st.markdown(f"- 大量保有報告: **{edinet_count}件**")
+                        max_ratio = sel_row.get("edinet_max_ratio")
+                        if pd.notna(max_ratio):
+                            st.markdown(f"- 最大保有割合: **{max_ratio*100:.1f}%**")
+                        if sel_row.get("edinet_activist"):
+                            st.markdown(f"- EDINET アクティビスト: **{sel_row['edinet_activist_names']}**")
 
                 price_fig = make_price_chart(sel_code)
                 if price_fig:

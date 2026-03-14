@@ -1,20 +1,26 @@
-"""TOB スクリーニング データ更新スクリプト (v3 - J-Quants API)
+"""TOB スクリーニング データ更新スクリプト (v3 - J-Quants API + EDINET)
 
 Phase 1: マスター同期 — J-Quants 銘柄一覧 → tob_stocks
 Phase 2: 株価更新   — J-Quants 日次株価 → price_history → 指標算出
 Phase 3: 財務更新   — J-Quants 決算サマリー → tob_stocks
 Phase 4: 指標算出   — price_history + 財務データ → market_cap / pbr / net_cash_ratio
 Phase 5: 親会社情報 — yfinance アクティビスト判定（据置）
+Phase 6: EDINET    — 大量保有報告書 → edinet_holders (アクティビスト検出強化)
 """
 
 import os
+import io
+import re
 import time
 import logging
-from datetime import datetime, timezone
+import zipfile
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
+import requests
 import jquantsapi
 import yfinance as yf
 from supabase import create_client
@@ -25,12 +31,16 @@ from supabase import create_client
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", os.environ.get("SUPABASE_KEY"))
 JQUANTS_API_KEY = os.environ["JQUANTS_API_KEY"]
+EDINET_API_KEY = os.environ.get("EDINET_API_KEY", "")
 
 MAX_WORKERS = 3
 RATE_LIMIT_INTERVAL = 15.0  # 秒 (Free tier 5 req/min → 12s間隔、余裕込みで15s)
 PRICE_HISTORY_DAYS = 260    # 約1年分の営業日数
 FIN_BOOTSTRAP_DAYS = 150    # 初回: 約7ヶ月分（ほぼ全銘柄カバー）
 FIN_DAILY_MAX_DAYS = 30     # 日次更新時の最大取得日数
+EDINET_API_BASE = "https://api.edinet-fsa.go.jp/api/v2"
+EDINET_BOOTSTRAP_DAYS = 90  # 初回: 過去90日分
+EDINET_DAILY_DAYS = 3       # 日次: 過去3日分（土日祝を考慮）
 
 ACTIVIST_KEYWORDS = [
     "effissimo", "エフィッシモ",
@@ -628,6 +638,236 @@ def update_parent_extra():
 
 
 # ---------------------------------------------------------------------------
+# Phase 6: EDINET 大量保有報告書 (アクティビスト検出強化)
+# ---------------------------------------------------------------------------
+def edinet_get_documents(date_str: str) -> list[dict]:
+    """EDINET API: 指定日の書類一覧取得。date_str は YYYY-MM-DD 形式。"""
+    resp = requests.get(
+        f"{EDINET_API_BASE}/documents.json",
+        params={"date": date_str, "type": 2, "Subscription-Key": EDINET_API_KEY},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data.get("results", [])
+
+
+def edinet_download_xbrl(doc_id: str) -> bytes | None:
+    """EDINET API: XBRL ZIP ダウンロード。"""
+    try:
+        resp = requests.get(
+            f"{EDINET_API_BASE}/documents/{doc_id}",
+            params={"type": 1, "Subscription-Key": EDINET_API_KEY},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.content
+    except Exception as e:
+        log.warning(f"  XBRL ダウンロード失敗 {doc_id}: {e}")
+        return None
+
+
+def parse_holder_xbrl(zip_bytes: bytes) -> dict | None:
+    """大量保有報告書 XBRL ZIP から保有割合等を抽出。"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            xbrl_files = [f for f in zf.namelist()
+                          if f.endswith('.xbrl') and 'PublicDoc' in f]
+            if not xbrl_files:
+                return None
+
+            with zf.open(xbrl_files[0]) as f:
+                tree = ET.parse(f)
+
+            root = tree.getroot()
+            result = {}
+
+            # 名前空間に依存しない検索で保有割合を抽出
+            for elem in root.iter():
+                tag = elem.tag.split('}')[-1] if '}' in elem.tag else elem.tag
+
+                # 保有割合（変更後 or 初回）
+                # PerLastReport は前回の値なので除外
+                if ('HoldingRatio' in tag
+                        and 'PerLastReport' not in tag
+                        and elem.text):
+                    try:
+                        ratio = float(elem.text.strip())
+                        if ratio > 0:
+                            # AfterChange (変更後) を優先、なければ最初に見つかった値
+                            if 'AfterChange' in tag:
+                                result['holding_ratio'] = ratio
+                            elif 'holding_ratio' not in result:
+                                result['holding_ratio'] = ratio
+                    except ValueError:
+                        pass
+
+                # 保有目的
+                if 'PurposeOfHolding' in tag and elem.text and elem.text.strip():
+                    purpose = elem.text.strip()[:500]
+                    if len(purpose) > 2:  # 空でない実質的な内容のみ
+                        result['purpose'] = purpose
+
+            return result if result else None
+    except (zipfile.BadZipFile, ET.ParseError):
+        return None
+    except Exception as e:
+        log.debug(f"  XBRL解析エラー: {e}")
+        return None
+
+
+def check_activist_name(name: str) -> bool:
+    """ファイラー名がアクティビストキーワードに該当するか判定。"""
+    name_lower = name.lower()
+    for kw in ACTIVIST_KEYWORDS:
+        if kw.lower() in name_lower:
+            return True
+    return False
+
+
+def get_latest_edinet_date() -> str | None:
+    """edinet_holders テーブルの最新 report_date (YYYY-MM-DD)。"""
+    resp = (supabase.table("edinet_holders")
+            .select("report_date")
+            .order("report_date", desc=True)
+            .limit(1)
+            .execute())
+    if resp.data and resp.data[0].get("report_date"):
+        return resp.data[0]["report_date"]
+    return None
+
+
+def sync_edinet_holders():
+    """Phase 6: EDINET 大量保有報告書の同期。"""
+    if not EDINET_API_KEY:
+        log.info("Phase 6: EDINET_API_KEY 未設定、スキップ")
+        return
+
+    log.info("Phase 6: EDINET 大量保有報告書同期")
+
+    # 対象銘柄コード一覧
+    stocks = fetch_all_rows("tob_stocks", "code")
+    valid_codes = {r["code"] for r in stocks}
+
+    # 既存 doc_id 一覧（重複ダウンロード回避）
+    existing_docs = fetch_all_rows("edinet_holders", "doc_id")
+    existing_doc_ids = {r["doc_id"] for r in existing_docs}
+
+    # 取得日範囲の決定
+    latest = get_latest_edinet_date()
+    today = datetime.now(timezone.utc).date()
+
+    if latest:
+        # 差分更新: 最終更新日の翌日から
+        start_date = datetime.strptime(latest, "%Y-%m-%d").date() + timedelta(days=1)
+        if start_date > today:
+            log.info("  EDINET データは最新です")
+            return
+        days_to_fetch = (today - start_date).days + 1
+        log.info(f"  差分取得: {start_date} 〜 {today} ({days_to_fetch} 日)")
+    else:
+        # 初回ブートストラップ
+        days_to_fetch = EDINET_BOOTSTRAP_DAYS
+        start_date = today - timedelta(days=days_to_fetch - 1)
+        log.info(f"  ブートストラップ: 過去 {days_to_fetch} 日分")
+
+    # 日ごとに書類一覧を取得
+    total_found = 0
+    total_parsed = 0
+    rows_to_upsert = []
+
+    for day_offset in range(days_to_fetch):
+        target_date = start_date + timedelta(days=day_offset)
+        date_str = target_date.strftime("%Y-%m-%d")
+
+        try:
+            docs = edinet_get_documents(date_str)
+        except Exception as e:
+            log.warning(f"  EDINET 書類一覧取得失敗 {date_str}: {e}")
+            time.sleep(1)
+            continue
+
+        # 大量保有報告書 (350) / 変更報告書 (360) をフィルタ
+        holder_docs = [
+            d for d in docs
+            if d.get("docTypeCode") in ("350", "360")
+            and d.get("secCode")
+            and d.get("xbrlFlag") == "1"
+        ]
+
+        for doc in holder_docs:
+            doc_id = doc.get("docID")
+            if not doc_id or doc_id in existing_doc_ids:
+                continue
+
+            sec_code = doc["secCode"][:4]  # 5桁 → 4桁
+            if sec_code not in valid_codes:
+                continue
+
+            filer_name = doc.get("filerName", "")
+            if not filer_name:
+                continue
+
+            total_found += 1
+
+            # XBRL ダウンロード＆解析
+            zip_bytes = edinet_download_xbrl(doc_id)
+            if not zip_bytes:
+                continue
+
+            parsed = parse_holder_xbrl(zip_bytes)
+            holding_ratio = parsed.get("holding_ratio") if parsed else None
+            purpose = parsed.get("purpose") if parsed else None
+
+            is_activist = check_activist_name(filer_name)
+            if purpose:
+                # 保有目的にもアクティビスト関連キーワードがないか確認
+                purpose_keywords = ["経営改善", "株主提案", "株主価値", "企業価値向上",
+                                    "資本効率", "ガバナンス", "支配", "買収"]
+                for pk in purpose_keywords:
+                    if pk in purpose:
+                        is_activist = True
+                        break
+
+            row = {
+                "doc_id": doc_id,
+                "code": sec_code,
+                "filer_name": filer_name,
+                "holding_ratio": holding_ratio,
+                "purpose": purpose,
+                "report_date": date_str,
+                "doc_type_code": doc["docTypeCode"],
+                "is_activist": is_activist,
+            }
+            rows_to_upsert.append(row)
+            existing_doc_ids.add(doc_id)
+            total_parsed += 1
+
+            # EDINET に過度な負荷をかけない
+            time.sleep(0.5)
+
+        # 日ごとのバッチ保存
+        if rows_to_upsert and len(rows_to_upsert) >= 50:
+            upsert_batch("edinet_holders", rows_to_upsert, "doc_id")
+            log.info(f"  中間保存: {len(rows_to_upsert)} 件")
+            rows_to_upsert = []
+
+        if (day_offset + 1) % 10 == 0:
+            log.info(f"  EDINET 取得: {day_offset + 1}/{days_to_fetch} 日完了 "
+                     f"(発見: {total_found}, 解析: {total_parsed})")
+
+        # API レート配慮
+        time.sleep(0.3)
+
+    # 残りを保存
+    if rows_to_upsert:
+        upsert_batch("edinet_holders", rows_to_upsert, "doc_id")
+
+    log.info(f"  EDINET 同期完了: {total_found} 件発見, {total_parsed} 件解析・保存")
+
+
+# ---------------------------------------------------------------------------
 # メイン
 # ---------------------------------------------------------------------------
 def main():
@@ -653,6 +893,9 @@ def main():
 
     # Phase 5: 親会社情報更新
     update_parent_extra()
+
+    # Phase 6: EDINET 大量保有報告書
+    sync_edinet_holders()
 
     elapsed = time.time() - start
     log.info(f"=== TOB データ更新完了 ({elapsed:.0f}秒) ===")
