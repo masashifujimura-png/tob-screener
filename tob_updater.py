@@ -62,6 +62,8 @@ ACTIVIST_KEYWORDS = [
     "3d investment", "3Dインベストメント",
     "rmb capital",
     "nippon active value", "ニッポン・アクティブ・バリュー",
+    "ひびき", "hibiki",
+    "シンプレクス・アセット", "simplex asset",
 ]
 
 logging.basicConfig(
