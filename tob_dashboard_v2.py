@@ -418,7 +418,7 @@ def main():
 
         display = view[["code", "name", "market", "tob_score", "pbr",
                          "net_cash_ratio", "market_cap", "top_sh_name",
-                         "parent_pbr", "free_float_ratio", "activist_in_parent",
+                         "parent_pbr", "free_float_ratio", "activist_names",
                          "edinet_activist_names", "edinet_max_ratio"]].copy()
         display.insert(0, "順位", range(1, len(display) + 1))
         display["tob_score"] = display["tob_score"].round(1)
@@ -432,9 +432,7 @@ def main():
         display["free_float_ratio"] = display["free_float_ratio"].apply(
             lambda x: f"{x*100:.1f}%" if pd.notna(x) else ""
         )
-        display["activist_in_parent"] = display["activist_in_parent"].map(
-            {True: "○", False: ""}
-        ).fillna("")
+        display["activist_names"] = display["activist_names"].fillna("")
         display["edinet_activist_names"] = display["edinet_activist_names"].fillna("")
         display["edinet_max_ratio"] = display["edinet_max_ratio"].apply(
             lambda x: f"{x*100:.1f}%" if pd.notna(x) else ""
@@ -443,7 +441,7 @@ def main():
         display.columns = [
             "順位", "コード", "銘柄名", "市場区分", "TOBスコア", "PBR",
             "NC比率(%)", "時価総額(億円)", "親会社",
-            "親会社PBR", "流動株比率", "親にアクティビスト",
+            "親会社PBR", "流動株比率", "親アクティビスト",
             "アクティビスト名", "最大保有割合",
         ]
 
