@@ -740,7 +740,13 @@ def get_latest_edinet_date() -> str | None:
 
 
 def sync_edinet_holders():
-    """Phase 6: EDINET 大量保有報告書の同期。"""
+    """Phase 6: EDINET 大量保有報告書の同期。
+
+    注意: 大量保有報告書の secCode はファイラー（報告者）の証券コードであり、
+    保有対象企業ではない。対象企業は issuerEdinetCode で特定する。
+    そのため、まず全書類から edinetCode → secCode のマッピングを構築し、
+    issuerEdinetCode から対象企業の証券コードを逆引きする。
+    """
     if not EDINET_API_KEY:
         log.info("Phase 6: EDINET_API_KEY 未設定、スキップ")
         return
@@ -760,7 +766,6 @@ def sync_edinet_holders():
     today = datetime.now(timezone.utc).date()
 
     if latest:
-        # 差分更新: 最終更新日の翌日から
         start_date = datetime.strptime(latest, "%Y-%m-%d").date() + timedelta(days=1)
         if start_date > today:
             log.info("  EDINET データは最新です")
@@ -768,15 +773,14 @@ def sync_edinet_holders():
         days_to_fetch = (today - start_date).days + 1
         log.info(f"  差分取得: {start_date} 〜 {today} ({days_to_fetch} 日)")
     else:
-        # 初回ブートストラップ
         days_to_fetch = EDINET_BOOTSTRAP_DAYS
         start_date = today - timedelta(days=days_to_fetch - 1)
         log.info(f"  ブートストラップ: 過去 {days_to_fetch} 日分")
 
-    # 日ごとに書類一覧を取得
-    total_found = 0
-    total_parsed = 0
-    rows_to_upsert = []
+    # --- Pass 1: 全日の書類一覧を取得し、edinetCode → secCode マッピングを構築 ---
+    log.info("  Pass 1: 書類一覧取得 & EDINET コードマッピング構築...")
+    edinet_to_stock = {}   # edinetCode → 4桁stock code
+    all_date_docs = {}     # date_str → list[doc]
 
     for day_offset in range(days_to_fetch):
         target_date = start_date + timedelta(days=day_offset)
@@ -789,11 +793,38 @@ def sync_edinet_holders():
             time.sleep(1)
             continue
 
+        all_date_docs[date_str] = docs
+
+        # 全書類から edinetCode → secCode マッピングを構築
+        for d in docs:
+            ec = d.get("edinetCode")
+            sc = d.get("secCode")
+            if ec and sc and len(sc) >= 4:
+                code4 = sc[:4]
+                if code4 in valid_codes:
+                    edinet_to_stock[ec] = code4
+
+        if (day_offset + 1) % 30 == 0:
+            log.info(f"  Pass 1: {day_offset + 1}/{days_to_fetch} 日完了 "
+                     f"(マッピング: {len(edinet_to_stock)} 件)")
+
+        time.sleep(0.3)
+
+    log.info(f"  Pass 1 完了: {len(all_date_docs)} 日分取得, "
+             f"マッピング {len(edinet_to_stock)} 件")
+
+    # --- Pass 2: 大量保有報告書を処理 ---
+    log.info("  Pass 2: 大量保有報告書を処理...")
+    total_found = 0
+    total_parsed = 0
+    total_unmapped = 0
+    rows_to_upsert = []
+
+    for date_str, docs in sorted(all_date_docs.items()):
         # 大量保有報告書 (350) / 変更報告書 (360) をフィルタ
         holder_docs = [
             d for d in docs
             if d.get("docTypeCode") in ("350", "360")
-            and d.get("secCode")
             and d.get("xbrlFlag") == "1"
         ]
 
@@ -802,12 +833,18 @@ def sync_edinet_holders():
             if not doc_id or doc_id in existing_doc_ids:
                 continue
 
-            sec_code = doc["secCode"][:4]  # 5桁 → 4桁
-            if sec_code not in valid_codes:
-                continue
-
             filer_name = doc.get("filerName", "")
             if not filer_name:
+                continue
+
+            # issuerEdinetCode から対象企業の証券コードを逆引き
+            issuer_edinet = doc.get("issuerEdinetCode")
+            if not issuer_edinet:
+                continue
+
+            target_code = edinet_to_stock.get(issuer_edinet)
+            if not target_code or target_code not in valid_codes:
+                total_unmapped += 1
                 continue
 
             total_found += 1
@@ -823,7 +860,6 @@ def sync_edinet_holders():
 
             is_activist = check_activist_name(filer_name)
             if purpose:
-                # 保有目的にもアクティビスト関連キーワードがないか確認
                 purpose_keywords = ["経営改善", "株主提案", "株主価値", "企業価値向上",
                                     "資本効率", "ガバナンス", "支配", "買収"]
                 for pk in purpose_keywords:
@@ -833,7 +869,7 @@ def sync_edinet_holders():
 
             row = {
                 "doc_id": doc_id,
-                "code": sec_code,
+                "code": target_code,
                 "filer_name": filer_name,
                 "holding_ratio": holding_ratio,
                 "purpose": purpose,
@@ -845,27 +881,20 @@ def sync_edinet_holders():
             existing_doc_ids.add(doc_id)
             total_parsed += 1
 
-            # EDINET に過度な負荷をかけない
             time.sleep(0.5)
 
-        # 日ごとのバッチ保存
+        # バッチ保存
         if rows_to_upsert and len(rows_to_upsert) >= 50:
             upsert_batch("edinet_holders", rows_to_upsert, "doc_id")
             log.info(f"  中間保存: {len(rows_to_upsert)} 件")
             rows_to_upsert = []
 
-        if (day_offset + 1) % 10 == 0:
-            log.info(f"  EDINET 取得: {day_offset + 1}/{days_to_fetch} 日完了 "
-                     f"(発見: {total_found}, 解析: {total_parsed})")
-
-        # API レート配慮
-        time.sleep(0.3)
-
     # 残りを保存
     if rows_to_upsert:
         upsert_batch("edinet_holders", rows_to_upsert, "doc_id")
 
-    log.info(f"  EDINET 同期完了: {total_found} 件発見, {total_parsed} 件解析・保存")
+    log.info(f"  EDINET 同期完了: {total_found} 件発見, {total_parsed} 件解析・保存"
+             f" (マッピング不明: {total_unmapped} 件)")
 
 
 # ---------------------------------------------------------------------------

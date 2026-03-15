@@ -139,12 +139,15 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
         df["top_sh_name"] = None
         df["top_sh_pct"] = None
 
-    # 親会社追加情報マージ
+    # 親会社PBR: tob_stocks から直接取得（parent_extra の古い値に依存しない）
+    code_to_pbr = df.set_index("code")["pbr"].to_dict()
+    df["parent_pbr"] = df["top_sh_code"].map(
+        lambda x: code_to_pbr.get(x) if pd.notna(x) else None
+    )
+
+    # 親会社アクティビスト情報: parent_extra から取得
     if not pe.empty:
         pe_map = pe.set_index("parent_code").to_dict("index")
-        df["parent_pbr"] = df["top_sh_code"].map(
-            lambda x: pe_map.get(x, {}).get("parent_pbr") if pd.notna(x) else None
-        )
         df["activist_in_parent"] = df["top_sh_code"].map(
             lambda x: pe_map.get(x, {}).get("activist_in_parent", False) if pd.notna(x) else False
         )
@@ -152,7 +155,6 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
             lambda x: pe_map.get(x, {}).get("activist_names", "") if pd.notna(x) else ""
         )
     else:
-        df["parent_pbr"] = None
         df["activist_in_parent"] = False
         df["activist_names"] = ""
 
@@ -160,7 +162,6 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
     df["edinet_activist"] = False
     df["edinet_activist_names"] = ""
     df["edinet_max_ratio"] = None
-    df["edinet_holder_count"] = 0
 
     if edinet is not None and not edinet.empty:
         # 各銘柄ごとにファイラー別の最新報告のみ残す
@@ -175,8 +176,6 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
                 continue
 
             mask = df["code"] == code
-            df.loc[mask, "edinet_holder_count"] = len(code_holders)
-
             # 最大保有割合
             max_ratio = code_holders["holding_ratio"].max()
             if pd.notna(max_ratio):
@@ -228,7 +227,7 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     # アクティビスト介入あり = 100点、大量保有報告書あり = 30点、なし = 0点
     out["score_activist"] = np.where(
         out["edinet_activist"] | out["activist_in_parent"], 100,
-        np.where(out["edinet_holder_count"] > 0, 30, 0),
+        np.where(out["edinet_max_ratio"].notna() & (out["edinet_max_ratio"] > 0), 30, 0),
     )
 
     w_total = sum(weights.values())
@@ -418,22 +417,15 @@ def main():
         col6.metric("アクティビスト介入", f"{view['edinet_activist'].sum()}")
 
         display = view[["code", "name", "market", "tob_score", "pbr",
-                         "net_cash_ratio", "market_cap", "volume_ratio",
-                         "price_drop_pct", "top_sh_name", "top_sh_pct",
+                         "net_cash_ratio", "market_cap", "top_sh_name",
                          "parent_pbr", "free_float_ratio", "activist_in_parent",
-                         "edinet_activist", "edinet_activist_names",
-                         "edinet_holder_count", "edinet_max_ratio"]].copy()
+                         "edinet_activist_names", "edinet_max_ratio"]].copy()
         display.insert(0, "順位", range(1, len(display) + 1))
         display["tob_score"] = display["tob_score"].round(1)
         display["pbr"] = display["pbr"].round(2)
         display["net_cash_ratio"] = (display["net_cash_ratio"] * 100).round(1)
         display["market_cap"] = (display["market_cap"] / 1e8).round(0)
-        display["volume_ratio"] = display["volume_ratio"].round(2)
-        display["price_drop_pct"] = (display["price_drop_pct"] * 100).round(1)
         display["top_sh_name"] = display["top_sh_name"].fillna("")
-        display["top_sh_pct"] = display["top_sh_pct"].apply(
-            lambda x: f"{x:.1f}%" if pd.notna(x) else ""
-        )
         display["parent_pbr"] = display["parent_pbr"].apply(
             lambda x: f"{x:.2f}" if pd.notna(x) else ""
         )
@@ -443,9 +435,6 @@ def main():
         display["activist_in_parent"] = display["activist_in_parent"].map(
             {True: "○", False: ""}
         ).fillna("")
-        display["edinet_activist"] = display["edinet_activist"].map(
-            {True: "○", False: ""}
-        ).fillna("")
         display["edinet_activist_names"] = display["edinet_activist_names"].fillna("")
         display["edinet_max_ratio"] = display["edinet_max_ratio"].apply(
             lambda x: f"{x*100:.1f}%" if pd.notna(x) else ""
@@ -453,10 +442,9 @@ def main():
 
         display.columns = [
             "順位", "コード", "銘柄名", "市場区分", "TOBスコア", "PBR",
-            "NC比率(%)", "時価総額(億円)", "出来高倍率", "52週高値乖離(%)",
-            "親会社", "支配株主比率", "親会社PBR", "流動株比率",
-            "親にアクティビスト", "アクティビスト介入",
-            "アクティビスト名", "大量保有報告数", "最大保有割合",
+            "NC比率(%)", "時価総額(億円)", "親会社",
+            "親会社PBR", "流動株比率", "親にアクティビスト",
+            "アクティビスト名", "最大保有割合",
         ]
 
         st.subheader("TOBスコア ランキング")
@@ -501,14 +489,11 @@ def main():
                         st.markdown("- 親子上場: 該当なし")
 
                     # EDINET 大量保有報告書情報
-                    edinet_count = sel_row.get("edinet_holder_count", 0)
-                    if edinet_count > 0:
-                        st.markdown(f"- 大量保有報告: **{edinet_count}件**")
-                        max_ratio = sel_row.get("edinet_max_ratio")
-                        if pd.notna(max_ratio):
-                            st.markdown(f"- 最大保有割合: **{max_ratio*100:.1f}%**")
-                        if sel_row.get("edinet_activist"):
-                            st.markdown(f"- EDINET アクティビスト: **{sel_row['edinet_activist_names']}**")
+                    max_ratio = sel_row.get("edinet_max_ratio")
+                    if pd.notna(max_ratio) and max_ratio > 0:
+                        st.markdown(f"- 最大保有割合: **{max_ratio*100:.1f}%**")
+                    if sel_row.get("edinet_activist"):
+                        st.markdown(f"- EDINET アクティビスト: **{sel_row['edinet_activist_names']}**")
 
                 # 大株主テーブル（EDINET 有価証券報告書）
                 sel_shareholders = edinet_sh_df[edinet_sh_df["code"] == sel_code].sort_values("rank")
