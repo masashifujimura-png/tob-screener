@@ -197,25 +197,15 @@ def merge_all(stocks: pd.DataFrame, ps: pd.DataFrame, pe: pd.DataFrame,
 def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     out = df.copy()
 
-    # PBR Score: PBR 2.0以下で高スコア（バックテスト: TOBターゲット中央値1.11）
+    # PBR Score: PBR 2.0以下で高スコア（バックテスト: リフト1.1x）
     pbr = out["pbr"].clip(lower=0, upper=5)
     out["score_pbr"] = np.where(pbr.isna(), 0, np.clip((2.0 - pbr) / 2.0, 0, 1) * 100)
 
-    nc = out["net_cash_ratio"].fillna(-1)
-    out["score_nc"] = np.clip((nc + 0.5) / 1.0, 0, 1) * 100
-
-    # Small Cap Score: 500億円以下で高スコア（バックテスト: 中央値1399億円）
-    mc = out["market_cap"].fillna(1e12)
-    mc_billion = mc / 1e9
-    out["score_smallcap"] = np.clip((500 - mc_billion) / 450, 0, 1) * 100
-
-    vr = out["volume_ratio"].fillna(1.0)
-    out["score_volume"] = np.clip((vr - 1.0) / 2.0, 0, 1) * 100
-
-    # Price Drop Score: 40%下落で満点（バックテスト: 最も有効なファクター）
+    # Price Drop Score: 40%下落で満点（バックテスト: リフト1.8x、最も有効な単一ファクター）
     pd_pct = out["price_drop_pct"].fillna(0)
     out["score_pricedrop"] = np.clip(pd_pct / 0.4, 0, 1) * 100
 
+    # Parent-Subsidiary Score: 親子上場（バックテスト: リフト9.1x）
     has_parent = out["top_sh_code"].notna()
     top_pct = out["top_sh_pct"].fillna(0)
     out["score_top_sh"] = np.where(
@@ -224,7 +214,6 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     )
 
     # Activist Score: EDINET 大量保有報告書ベースのアクティビスト検出
-    # アクティビスト介入あり = 100点、大量保有報告書あり = 30点、なし = 0点
     out["score_activist"] = np.where(
         out["edinet_activist"] | out["activist_in_parent"], 100,
         np.where(out["edinet_max_ratio"].notna() & (out["edinet_max_ratio"] > 0), 30, 0),
@@ -233,9 +222,6 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
     w_total = sum(weights.values())
     out["tob_score"] = (
         out["score_pbr"] * weights["pbr"]
-        + out["score_nc"] * weights["nc"]
-        + out["score_smallcap"] * weights["smallcap"]
-        + out["score_volume"] * weights["volume"]
         + out["score_pricedrop"] * weights["pricedrop"]
         + out["score_top_sh"] * weights["top_sh"]
         + out["score_activist"] * weights.get("activist", 0)
@@ -248,10 +234,9 @@ def calculate_tob_score(df: pd.DataFrame, weights: dict) -> pd.DataFrame:
 # レーダーチャート
 # ---------------------------------------------------------------------------
 def make_radar_chart(row: pd.Series) -> go.Figure:
-    categories = ["PBR割安", "ネットキャッシュ", "低時価総額", "出来高急増", "株価下落", "親子上場", "アクティビスト"]
+    categories = ["PBR割安", "株価下落", "親子上場", "アクティビスト"]
     values = [
-        row["score_pbr"], row["score_nc"], row["score_smallcap"],
-        row["score_volume"], row["score_pricedrop"], row["score_top_sh"],
+        row["score_pbr"], row["score_pricedrop"], row["score_top_sh"],
         row.get("score_activist", 0),
     ]
     values_closed = values + [values[0]]
@@ -373,17 +358,13 @@ def main():
     only_with_parent = st.sidebar.checkbox("親子上場のみ表示")
 
     st.sidebar.header("指標ウェイト")
-    w_pbr = st.sidebar.slider("PBR割安", 0, 50, 25)
-    w_nc = st.sidebar.slider("ネットキャッシュ比率", 0, 50, 20)
-    w_smallcap = st.sidebar.slider("低時価総額", 0, 50, 20)
-    w_volume = st.sidebar.slider("出来高急増", 0, 50, 5)
+    w_pbr = st.sidebar.slider("PBR割安", 0, 50, 20)
     w_pricedrop = st.sidebar.slider("株価下落(52週高値比)", 0, 50, 25)
-    w_top_sh = st.sidebar.slider("親子上場", 0, 50, 20)
-    w_activist = st.sidebar.slider("アクティビスト(EDINET)", 0, 50, 15)
+    w_top_sh = st.sidebar.slider("親子上場", 0, 50, 35)
+    w_activist = st.sidebar.slider("アクティビスト(EDINET)", 0, 50, 20)
 
     weights = {
-        "pbr": w_pbr, "nc": w_nc, "smallcap": w_smallcap,
-        "volume": w_volume, "pricedrop": w_pricedrop, "top_sh": w_top_sh,
+        "pbr": w_pbr, "pricedrop": w_pricedrop, "top_sh": w_top_sh,
         "activist": w_activist,
     }
 
