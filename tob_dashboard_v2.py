@@ -358,10 +358,10 @@ def main():
     only_with_parent = st.sidebar.checkbox("親子上場のみ表示")
 
     st.sidebar.header("指標ウェイト")
-    w_pbr = st.sidebar.slider("PBR割安", 0, 50, 20)
+    w_pbr = st.sidebar.slider("PBR割安", 0, 50, 15)
     w_pricedrop = st.sidebar.slider("株価下落(52週高値比)", 0, 50, 25)
-    w_top_sh = st.sidebar.slider("親子上場", 0, 50, 35)
-    w_activist = st.sidebar.slider("アクティビスト(EDINET)", 0, 50, 20)
+    w_top_sh = st.sidebar.slider("親子上場", 0, 50, 30)
+    w_activist = st.sidebar.slider("アクティビスト(EDINET)", 0, 50, 30)
 
     weights = {
         "pbr": w_pbr, "pricedrop": w_pricedrop, "top_sh": w_top_sh,

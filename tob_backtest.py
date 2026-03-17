@@ -194,7 +194,7 @@ def compute_factor_scores(row: dict, tob_type: str = "") -> dict:
     scores["score_activist"] = 100 if tob_type == "敵対的" else 0
 
     # ダッシュボードのデフォルト重み
-    w = {"pbr": 20, "pricedrop": 25, "top_sh": 35, "activist": 20}
+    w = {"pbr": 15, "pricedrop": 25, "top_sh": 30, "activist": 30}
     w_total = sum(w.values())
     scores["tob_score"] = (
         scores["score_pbr"] * w["pbr"]
