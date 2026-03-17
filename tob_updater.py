@@ -4,7 +4,7 @@ Phase 1: マスター同期 — J-Quants 銘柄一覧 → tob_stocks
 Phase 2: 株価更新   — J-Quants 日次株価 → price_history → 指標算出
 Phase 3: 財務更新   — J-Quants 決算サマリー → tob_stocks
 Phase 4: 指標算出   — price_history + 財務データ → market_cap / pbr / net_cash_ratio
-Phase 5: 親会社情報 — yfinance アクティビスト判定（据置）
+Phase 5: 親会社情報 — EDINET ベースでアクティビスト判定
 Phase 6: EDINET    — 大量保有報告書 → edinet_holders (アクティビスト検出強化)
 Phase 7: EDINET    — 有価証券報告書 → キャッシュフロー + 大株主構成
 """
@@ -17,13 +17,11 @@ import logging
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
 import requests
 import jquantsapi
-import yfinance as yf
 from supabase import create_client
 
 # ---------------------------------------------------------------------------
@@ -34,13 +32,12 @@ SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", os.environ.get("SUPABASE_K
 JQUANTS_API_KEY = os.environ["JQUANTS_API_KEY"]
 EDINET_API_KEY = os.environ.get("EDINET_API_KEY", "")
 
-MAX_WORKERS = 3
 RATE_LIMIT_INTERVAL = 15.0  # 秒 (Free tier 5 req/min → 12s間隔、余裕込みで15s)
 PRICE_HISTORY_DAYS = 260    # 約1年分の営業日数
 FIN_BOOTSTRAP_DAYS = 150    # 初回: 約7ヶ月分（ほぼ全銘柄カバー）
 FIN_DAILY_MAX_DAYS = 30     # 日次更新時の最大取得日数
 EDINET_API_BASE = "https://api.edinet-fsa.go.jp/api/v2"
-EDINET_BOOTSTRAP_DAYS = 90  # 初回: 過去90日分
+EDINET_BOOTSTRAP_DAYS = 730  # 初回: 過去2年分
 EDINET_DAILY_DAYS = 3       # 日次: 過去3日分（土日祝を考慮）
 
 ACTIVIST_KEYWORDS = [
@@ -64,6 +61,17 @@ ACTIVIST_KEYWORDS = [
     "nippon active value", "ニッポン・アクティブ・バリュー",
     "ひびき", "hibiki",
     "シンプレクス・アセット", "simplex asset",
+]
+
+# 大量保有報告書の「保有目的」欄でアクティビストを自動検出するキーワード
+PURPOSE_ACTIVIST_KEYWORDS = [
+    "経営改善", "株主提案", "株主価値", "企業価値向上",
+    "資本効率", "ガバナンス", "支配", "買収",
+    "経営への助言", "経営陣への提言", "経営に関する助言",
+    "株主還元", "資本政策", "自社株買い", "増配",
+    "取締役の選任", "取締役の派遣", "役員の選解任",
+    "事業の再編", "事業ポートフォリオ", "重要提案行為",
+    "経営方針", "経営戦略", "経営体制",
 ]
 
 logging.basicConfig(
@@ -575,30 +583,11 @@ def compute_and_update_metrics(code_to_info: dict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 5: 親会社情報更新 (yfinance - 据置)
+# Phase 5: 親会社情報更新 (EDINET ベース)
 # ---------------------------------------------------------------------------
-def check_activist_holders(code: str) -> tuple[bool, list[str]]:
-    try:
-        tk = yf.Ticker(f"{code}.T")
-        holders = tk.institutional_holders
-        if holders is None or holders.empty:
-            return False, []
-        found = []
-        for _, row in holders.iterrows():
-            holder_name = str(row.get("Holder", ""))
-            holder_lower = holder_name.lower()
-            for kw in ACTIVIST_KEYWORDS:
-                if kw.lower() in holder_lower:
-                    found.append(holder_name)
-                    break
-        return len(found) > 0, found
-    except Exception:
-        return False, []
-
-
 def update_parent_extra():
-    """親会社の追加情報（PBR・アクティビスト）を更新。"""
-    log.info("Phase 5: 親会社情報更新")
+    """親会社の追加情報（PBR・アクティビスト）を EDINET データから更新。"""
+    log.info("Phase 5: 親会社情報更新 (EDINET ベース)")
 
     ps_resp = supabase.table("parent_subsidiary").select("parent_code").execute()
     if not ps_resp.data:
@@ -610,34 +599,42 @@ def update_parent_extra():
     pbr_resp = supabase.table("tob_stocks").select("code, pbr").execute()
     code_to_pbr = {r["code"]: r.get("pbr") for r in pbr_resp.data} if pbr_resp.data else {}
 
+    # edinet_holders から全レコード取得（親会社コードでフィルタ）
+    all_edinet = fetch_all_rows("edinet_holders", "doc_id")
+    edinet_df = pd.DataFrame(all_edinet) if all_edinet else pd.DataFrame()
+
     now = datetime.now(timezone.utc).isoformat()
     parent_extra_rows = []
-    done = 0
-    batch_size = 30
+    activist_count = 0
 
-    for i in range(0, len(parent_codes), batch_size):
-        batch = parent_codes[i:i + batch_size]
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {executor.submit(check_activist_holders, pc): pc for pc in batch}
-            for future in as_completed(futures):
-                done += 1
-                pc = futures[future]
-                has_activist, activist_names = future.result()
-                parent_extra_rows.append({
-                    "parent_code": pc,
-                    "parent_pbr": safe_float(code_to_pbr.get(pc)),
-                    "activist_in_parent": has_activist,
-                    "activist_names": ", ".join(activist_names) if activist_names else "",
-                    "updated_at": now,
-                })
-                if done % 20 == 0:
-                    log.info(f"  親会社 {done}/{len(parent_codes)} 処理済")
-        if i + batch_size < len(parent_codes):
-            time.sleep(1)
+    for pc in parent_codes:
+        has_activist = False
+        activist_names = []
+
+        if not edinet_df.empty and "code" in edinet_df.columns:
+            pc_holders = edinet_df[edinet_df["code"] == pc]
+            if not pc_holders.empty:
+                # ファイラー別に最新レコードのみ残す
+                latest = (pc_holders.sort_values("report_date", ascending=False)
+                          .drop_duplicates("filer_name", keep="first"))
+                activist_rows = latest[latest["is_activist"] == True]
+                if not activist_rows.empty:
+                    has_activist = True
+                    activist_names = activist_rows["filer_name"].unique().tolist()
+                    activist_count += 1
+
+        parent_extra_rows.append({
+            "parent_code": pc,
+            "parent_pbr": safe_float(code_to_pbr.get(pc)),
+            "activist_in_parent": has_activist,
+            "activist_names": ", ".join(activist_names) if activist_names else "",
+            "updated_at": now,
+        })
 
     if parent_extra_rows:
         upsert_batch("parent_extra", parent_extra_rows, "parent_code")
-    log.info(f"  親会社情報更新完了: {len(parent_extra_rows)} 件")
+    log.info(f"  親会社情報更新完了: {len(parent_extra_rows)} 件 "
+             f"(アクティビスト検出: {activist_count} 件)")
 
 
 # ---------------------------------------------------------------------------
@@ -861,13 +858,11 @@ def sync_edinet_holders():
             purpose = parsed.get("purpose") if parsed else None
 
             is_activist = check_activist_name(filer_name)
-            if purpose:
-                purpose_keywords = ["経営改善", "株主提案", "株主価値", "企業価値向上",
-                                    "資本効率", "ガバナンス", "支配", "買収"]
-                for pk in purpose_keywords:
-                    if pk in purpose:
-                        is_activist = True
-                        break
+            if purpose and not is_activist:
+                has_activist_purpose = any(pk in purpose for pk in PURPOSE_ACTIVIST_KEYWORDS)
+                is_pure_only = "純投資" in purpose and not has_activist_purpose
+                if has_activist_purpose and not is_pure_only:
+                    is_activist = True
 
             row = {
                 "doc_id": doc_id,
@@ -1189,11 +1184,11 @@ def main():
     # Phase 4: 指標算出
     compute_and_update_metrics(code_to_info)
 
-    # Phase 5: 親会社情報更新
-    update_parent_extra()
-
-    # Phase 6: EDINET 大量保有報告書
+    # Phase 6: EDINET 大量保有報告書 (Phase 5より先に実行)
     sync_edinet_holders()
+
+    # Phase 5: 親会社情報更新 (EDINET データに依存)
+    update_parent_extra()
 
     # Phase 7: EDINET 有価証券報告書
     sync_edinet_yuho()
