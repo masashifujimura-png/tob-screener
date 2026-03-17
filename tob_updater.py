@@ -599,8 +599,9 @@ def update_parent_extra():
     pbr_resp = supabase.table("tob_stocks").select("code, pbr").execute()
     code_to_pbr = {r["code"]: r.get("pbr") for r in pbr_resp.data} if pbr_resp.data else {}
 
-    # edinet_holders から全レコード取得（親会社コードでフィルタ）
-    all_edinet = fetch_all_rows("edinet_holders", "doc_id")
+    # edinet_holders から全レコード取得（アクティビスト判定に必要なカラム）
+    all_edinet = fetch_all_rows("edinet_holders",
+                                "doc_id,code,filer_name,is_activist,report_date")
     edinet_df = pd.DataFrame(all_edinet) if all_edinet else pd.DataFrame()
 
     now = datetime.now(timezone.utc).isoformat()
